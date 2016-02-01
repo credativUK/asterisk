@@ -29,7 +29,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419044 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/logger.h"
 #include "asterisk/codec.h"
@@ -245,7 +245,7 @@ int ast_codec_init(void)
 	}
 
 	ast_cli_register_multiple(codec_cli, ARRAY_LEN(codec_cli));
-	ast_register_atexit(codec_shutdown);
+	ast_register_cleanup(codec_shutdown);
 
 	return 0;
 }
@@ -296,8 +296,8 @@ int __ast_codec_register(struct ast_codec *codec, struct ast_module *mod)
 
 	ao2_link_flags(codecs, codec_new, OBJ_NOLOCK);
 
-	/* Once registered a codec can not be unregistered, and the module must persist */
-	ast_module_ref(mod);
+	/* Once registered a codec can not be unregistered, and the module must persist until shutdown */
+	ast_module_shutdown_ref(mod);
 
 	ast_verb(2, "Registered '%s' codec '%s' at sample rate '%u' with id '%u'\n",
 		ast_codec_media_type2str(codec->type), codec->name, codec->sample_rate, codec_new->id);
@@ -355,10 +355,7 @@ unsigned int ast_codec_samples_count(struct ast_frame *frame)
 		return 0;
 	}
 
-	/* BUGBUG - why not just get the codec pointer off the format?
-	This is a bit roundabout
-	*/
-	codec = ast_codec_get_by_id(ast_format_get_codec_id(frame->subclass.format));
+	codec = ast_format_get_codec(frame->subclass.format);
 
 	if (codec->samples_count) {
 		samples = codec->samples_count(frame);

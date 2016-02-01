@@ -595,6 +595,22 @@ int __ast_vm_register(const struct ast_vm_functions *vm_table, struct ast_module
  */
 void ast_vm_unregister(const char *module_name);
 
+#ifdef TEST_FRAMEWORK
+/*!
+ * \brief Swap out existing voicemail functions with a temporary set of functions for use with unit tests
+ *
+ * \param vm_table function table to use for testing
+ *
+ * \note ast_vm_test_swap_table_out should be called to restore the original set before testing concludes
+ */
+void ast_vm_test_swap_table_in(const struct ast_vm_functions *vm_table);
+
+/*!
+ * \brief Used after ast_vm_test_swap_table_in to restore the original set of voicemail functions
+ */
+void ast_vm_test_swap_table_out(void);
+#endif
+
 #define VM_GREETER_MODULE_VERSION 1
 
 /*! \brief Voicemail greeter function table definition. */
@@ -969,6 +985,8 @@ int ast_play_and_wait(struct ast_channel *chan, const char *fn);
  * \since 12
  */
 enum ast_record_if_exists {
+	/*! Return an Error State for IF_Exists */
+	AST_RECORD_IF_EXISTS_ERROR = -1,
 	/*! Fail the recording. */
 	AST_RECORD_IF_EXISTS_FAIL,
 	/*! Overwrite the existing recording. */

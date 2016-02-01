@@ -120,6 +120,18 @@ struct ast_format_interface {
 	 */
 	void (* const format_generate_sdp_fmtp)(const struct ast_format *format, unsigned int payload,
 		struct ast_str **str);
+
+	/*!
+	 * \since 13.6.0
+	 * \brief Retrieve a particular format attribute setting
+	 *
+	 * \param format The format containing attributes
+	 * \param name The name of the attribute to retrieve
+	 *
+	 * \retval NULL if the parameter is not set on the format
+	 * \retval non-NULL the format attribute value
+	 */
+	const void *(* const format_attribute_get)(const struct ast_format *format, const char *name);
 };
 
 /*!
@@ -204,6 +216,17 @@ struct ast_format *ast_format_attribute_set(const struct ast_format *format, con
 	const char *value);
 
 /*!
+ * \since 13.6.0
+ *
+ * \param format The format to retrieve the attribute from
+ * \param name Attribute name
+ *
+ * \retval non-NULL the attribute value
+ * \retval NULL the attribute does not exist or is unset
+ */
+const void *ast_format_attribute_get(const struct ast_format *format, const char *name);
+
+/*!
  * \brief This function is used to have a media format aware module parse and interpret
  * SDP attribute information. Once interpreted this information is stored on the format
  * itself using Asterisk format attributes.
@@ -274,6 +297,17 @@ void ast_format_set_attribute_data(struct ast_format *format, void *attribute_da
  * \return The name of the format
  */
 const char *ast_format_get_name(const struct ast_format *format);
+
+/*!
+ * \brief Get the codec associated with a format
+ *
+ * \param format The media format
+ *
+ * \return The codec
+ *
+ * \note The reference count of the returned codec is increased by 1 and must be decremented
+ */
+struct ast_codec *ast_format_get_codec(const struct ast_format *format);
 
 /*!
  * \brief Get the codec identifier associated with a format

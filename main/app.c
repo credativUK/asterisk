@@ -35,7 +35,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 427181 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #ifdef HAVE_SYS_STAT_H
 #include <sys/stat.h>
@@ -518,6 +518,57 @@ void ast_vm_unregister(const char *module_name)
 	}
 	ao2_cleanup(table);
 }
+
+#ifdef TEST_FRAMEWORK
+/*! \brief Holding container for the voicemail provider used while testing */
+static AO2_GLOBAL_OBJ_STATIC(vm_provider_holder);
+static int provider_is_swapped = 0;
+
+void ast_vm_test_swap_table_in(const struct ast_vm_functions *vm_table)
+{
+	RAII_VAR(struct ast_vm_functions *, holding_table, NULL, ao2_cleanup);
+	RAII_VAR(struct ast_vm_functions *, new_table, NULL, ao2_cleanup);
+
+	if (provider_is_swapped) {
+		ast_log(LOG_ERROR, "Attempted to swap in test function table without swapping out old test table.\n");
+		return;
+	}
+
+	holding_table = ao2_global_obj_ref(vm_provider);
+
+	if (holding_table) {
+		ao2_global_obj_replace_unref(vm_provider_holder, holding_table);
+	}
+
+	new_table = ao2_alloc_options(sizeof(*new_table), NULL, AO2_ALLOC_OPT_LOCK_NOLOCK);
+	if (!new_table) {
+		return;
+	}
+	*new_table = *vm_table;
+
+	ao2_global_obj_replace_unref(vm_provider, new_table);
+	provider_is_swapped = 1;
+}
+
+void ast_vm_test_swap_table_out(void)
+{
+	RAII_VAR(struct ast_vm_functions *, held_table, NULL, ao2_cleanup);
+
+	if (!provider_is_swapped) {
+		ast_log(LOG_ERROR, "Attempted to swap out test function table, but none is currently installed.\n");
+		return;
+	}
+
+	held_table = ao2_global_obj_ref(vm_provider_holder);
+	if (!held_table) {
+		return;
+	}
+
+	ao2_global_obj_replace_unref(vm_provider, held_table);
+	ao2_global_obj_release(vm_provider_holder);
+	provider_is_swapped = 0;
+}
+#endif
 
 /*! \brief The container for the voicemail greeter provider */
 static AO2_GLOBAL_OBJ_STATIC(vm_greeter_provider);
@@ -1463,6 +1514,9 @@ static int __ast_play_and_record(struct ast_channel *chan, const char *playfile,
 		break;
 	case AST_RECORD_IF_EXISTS_APPEND:
 		ioflags |= O_APPEND;
+		break;
+	case AST_RECORD_IF_EXISTS_ERROR:
+		ast_assert(0);
 		break;
 	}
 
@@ -2911,7 +2965,9 @@ int ast_safe_fork(int stop_reaper)
 		ast_replace_sigchld();
 	}
 
-	sigfillset(&signal_set);
+	/* GCC 4.9 gives a bogus "right-hand operand of comma expression has
+	 * no effect" warning */
+	(void) sigfillset(&signal_set);
 	pthread_sigmask(SIG_BLOCK, &signal_set, &old_set);
 
 	pid = fork();

@@ -298,6 +298,18 @@
 			Use the <replaceable>PJSIP_ENDPOINT</replaceable> function to obtain
 			further endpoint related information.</para>
 		</enum>
+		<enum name="contact">
+			<para>R/O The name of the contact associated with this channel.
+			Use the <replaceable>PJSIP_CONTACT</replaceable> function to obtain
+			further contact related information. Note this may not be present and if so
+			is only available on outgoing legs.</para>
+		</enum>
+		<enum name="aor">
+			<para>R/O The name of the AOR associated with this channel.
+			Use the <replaceable>PJSIP_AOR</replaceable> function to obtain
+			further AOR related information. Note this may not be present and if so
+			is only available on outgoing legs.</para>
+		</enum>
 		<enum name="pjsip">
 			<para>R/O Obtain information about the current PJSIP channel and its
 			session.</para>
@@ -306,6 +318,9 @@
 				<literal>type</literal> parameter must be provided. It specifies
 				which signalling parameter to read.</para>
 				<enumlist>
+					<enum name="call-id">
+						<para>The SIP call-id.</para>
+					</enum>
 					<enum name="secure">
 						<para>Whether or not the signalling uses a secure transport.</para>
 						<enumlist>
@@ -357,7 +372,7 @@
 #include <pjlib.h>
 #include <pjsip_ua.h>
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 424622 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/astobj2.h"
 #include "asterisk/module.h"
@@ -579,8 +594,22 @@ static int channel_read_pjsip(struct ast_channel *chan, const char *type, const 
 
 	dlg = channel->session->inv_session->dlg;
 
-	if (!strcmp(type, "secure")) {
-		snprintf(buf, buflen, "%d", dlg->secure ? 1 : 0);
+	if (ast_strlen_zero(type)) {
+		ast_log(LOG_WARNING, "You must supply a type field for 'pjsip' information\n");
+		return -1;
+	} else if (!strcmp(type, "call-id")) {
+		snprintf(buf, buflen, "%.*s", (int) pj_strlen(&dlg->call_id->id), pj_strbuf(&dlg->call_id->id));
+	} else if (!strcmp(type, "secure")) {
+#ifdef HAVE_PJSIP_GET_DEST_INFO
+		pjsip_host_info dest;
+		pj_pool_t *pool = pjsip_endpt_create_pool(ast_sip_get_pjsip_endpoint(), "secure-check", 128, 128);
+		pjsip_get_dest_info(dlg->target, NULL, pool, &dest);
+		snprintf(buf, buflen, "%d", dest.flag & PJSIP_TRANSPORT_SECURE ? 1 : 0);
+		pjsip_endpt_release_pool(ast_sip_get_pjsip_endpoint(), pool);
+#else
+		ast_log(LOG_WARNING, "Asterisk has been built against a version of pjproject which does not have the required functionality to support the 'secure' argument. Please upgrade to version 2.3 or later.\n");
+		return -1;
+#endif
 	} else if (!strcmp(type, "target_uri")) {
 		pjsip_uri_print(PJSIP_URI_IN_REQ_URI, dlg->target, buf, buflen);
 		buf_copy = ast_strdupa(buf);
@@ -667,6 +696,28 @@ static int read_pjsip(void *data)
 			return -1;
 		}
 		snprintf(func_args->buf, func_args->len, "%s", ast_sorcery_object_get_id(pvt->session->endpoint));
+	} else if (!strcmp(func_args->param, "contact")) {
+		struct ast_sip_channel_pvt *pvt = ast_channel_tech_pvt(func_args->chan);
+
+		if (!pvt) {
+			ast_log(AST_LOG_WARNING, "Channel %s has no pvt!\n", ast_channel_name(func_args->chan));
+			return -1;
+		}
+		if (!pvt->session || !pvt->session->contact) {
+			return 0;
+		}
+		snprintf(func_args->buf, func_args->len, "%s", ast_sorcery_object_get_id(pvt->session->contact));
+	} else if (!strcmp(func_args->param, "aor")) {
+		struct ast_sip_channel_pvt *pvt = ast_channel_tech_pvt(func_args->chan);
+
+		if (!pvt) {
+			ast_log(AST_LOG_WARNING, "Channel %s has no pvt!\n", ast_channel_name(func_args->chan));
+			return -1;
+		}
+		if (!pvt->session || !pvt->session->aor) {
+			return 0;
+		}
+		snprintf(func_args->buf, func_args->len, "%s", ast_sorcery_object_get_id(pvt->session->aor));
 	} else if (!strcmp(func_args->param, "pjsip")) {
 		func_args->ret = channel_read_pjsip(func_args->chan, func_args->type,
 		                                    func_args->field, func_args->buf,
@@ -820,11 +871,11 @@ static int media_offer_read_av(struct ast_sip_session *session, char *buf,
 
 		/* add one since we'll include a comma */
 		size = strlen(ast_format_get_name(fmt)) + 1;
-		len -= size;
-		if ((len) < 0) {
+		if (len < size) {
 			ao2_ref(fmt, -1);
 			break;
 		}
+		len -= size;
 
 		/* no reason to use strncat here since we have already ensured buf has
                    enough space, so strcat can be safely used */

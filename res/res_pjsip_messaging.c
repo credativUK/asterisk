@@ -42,12 +42,15 @@
 #include "asterisk/pbx.h"
 #include "asterisk/res_pjsip.h"
 #include "asterisk/res_pjsip_session.h"
+#include "asterisk/taskprocessor.h"
 
 const pjsip_method pjsip_message_method = {PJSIP_OTHER_METHOD, {"MESSAGE", 7} };
 
 #define MAX_HDR_SIZE 512
 #define MAX_BODY_SIZE 1024
 #define MAX_USER_SIZE 128
+
+static struct ast_taskprocessor *message_serializer;
 
 /*!
  * \internal
@@ -427,13 +430,13 @@ static char *sip_to_pjsip(char *buf, int size, int capacity)
  */
 static enum pjsip_status_code rx_data_to_ast_msg(pjsip_rx_data *rdata, struct ast_msg *msg)
 {
-	struct ast_sip_endpoint *endpt = ast_pjsip_rdata_get_endpoint(rdata);
+	RAII_VAR(struct ast_sip_endpoint *, endpt, NULL, ao2_cleanup);
 	pjsip_uri *ruri = rdata->msg_info.msg->line.req.uri;
 	pjsip_sip_uri *sip_ruri;
 	pjsip_name_addr *name_addr;
 	char buf[MAX_BODY_SIZE];
 	const char *field;
-	const char *context = S_OR(endpt->message_context, endpt->context);
+	const char *context;
 	char exten[AST_MAX_EXTENSION];
 	int res = 0;
 	int size;
@@ -445,6 +448,10 @@ static enum pjsip_status_code rx_data_to_ast_msg(pjsip_rx_data *rdata, struct as
 	sip_ruri = pjsip_uri_get_uri(ruri);
 	ast_copy_pj_str(exten, &sip_ruri->user, AST_MAX_EXTENSION);
 
+	endpt = ast_pjsip_rdata_get_endpoint(rdata);
+	ast_assert(endpt != NULL);
+
+	context = S_OR(endpt->message_context, endpt->context);
 	res |= ast_msg_set_context(msg, "%s", context);
 	res |= ast_msg_set_exten(msg, "%s", exten);
 
@@ -589,7 +596,7 @@ static int sip_msg_send(const struct ast_msg *msg, const char *to, const char *f
 	}
 
 	if (!(mdata = msg_data_create(msg, to, from)) ||
-	    ast_sip_push_task(NULL, msg_send, mdata)) {
+	    ast_sip_push_task(message_serializer, msg_send, mdata)) {
 		ao2_ref(mdata, -1);
 		return -1;
 	}
@@ -606,7 +613,6 @@ static pj_status_t send_response(pjsip_rx_data *rdata, enum pjsip_status_code co
 {
 	pjsip_tx_data *tdata;
 	pj_status_t status;
-	pjsip_response_addr res_addr;
 
 	status = ast_sip_create_response(rdata, code, NULL, &tdata);
 	if (status != PJ_SUCCESS) {
@@ -617,13 +623,11 @@ static pj_status_t send_response(pjsip_rx_data *rdata, enum pjsip_status_code co
 	if (dlg && tsx) {
 		status = pjsip_dlg_send_response(dlg, tsx, tdata);
 	} else {
-		/* Get where to send request. */
-		status = pjsip_get_response_addr(tdata->pool, rdata, &res_addr);
-		if (status != PJ_SUCCESS) {
-			ast_log(LOG_ERROR, "Unable to get response address (%d)\n", status);
-			return status;
-		}
-		status = ast_sip_send_response(&res_addr, tdata, ast_pjsip_rdata_get_endpoint(rdata));
+		struct ast_sip_endpoint *endpoint;
+
+		endpoint = ast_pjsip_rdata_get_endpoint(rdata);
+		status = ast_sip_send_stateful_response(rdata, tdata, endpoint);
+		ao2_cleanup(endpoint);
 	}
 
 	if (status != PJ_SUCCESS) {
@@ -669,9 +673,16 @@ static pj_bool_t module_on_rx_request(pjsip_rx_data *rdata)
 		return PJ_TRUE;
 	}
 
-	/* send it to the messaging core */
-	ast_msg_queue(msg);
-	send_response(rdata, PJSIP_SC_ACCEPTED, NULL, NULL);
+	/* Send it to the messaging core.
+	 *
+	 * If we are unable to send a response, the most likely reason is that we
+	 * are handling a retransmission of an incoming MESSAGE and were unable to
+	 * create a transaction due to a duplicate key. If we are unable to send
+	 * a response, we should not queue the message to the dialplan
+	 */
+	if (!send_response(rdata, PJSIP_SC_ACCEPTED, NULL, NULL)) {
+		ast_msg_queue(msg);
+	}
 
 	return PJ_TRUE;
 }
@@ -681,9 +692,13 @@ static int incoming_in_dialog_request(struct ast_sip_session *session, struct pj
 	char buf[MAX_BODY_SIZE];
 	enum pjsip_status_code code;
 	struct ast_frame f;
-
 	pjsip_dialog *dlg = session->inv_session->dlg;
 	pjsip_transaction *tsx = pjsip_rdata_get_tsx(rdata);
+
+	if (!session->channel) {
+		send_response(rdata, PJSIP_SC_NOT_FOUND, dlg, tsx);
+		return 0;
+	}
 
 	if ((code = check_content_type(rdata)) != PJSIP_SC_OK) {
 		send_response(rdata, code, dlg, tsx);
@@ -692,6 +707,7 @@ static int incoming_in_dialog_request(struct ast_sip_session *session, struct pj
 
 	if (print_body(rdata, buf, sizeof(buf)-1) < 1) {
 		/* invalid body size */
+		send_response(rdata, PJSIP_SC_REQUEST_ENTITY_TOO_LARGE, dlg, tsx);
 		return 0;
 	}
 
@@ -742,6 +758,13 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	message_serializer = ast_sip_create_serializer();
+	if (!message_serializer) {
+		ast_sip_unregister_service(&messaging_module);
+		ast_msg_tech_unregister(&msg_tech);
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
 	ast_sip_session_register_supplement(&messaging_supplement);
 	return AST_MODULE_LOAD_SUCCESS;
 }
@@ -751,6 +774,7 @@ static int unload_module(void)
 	ast_sip_session_unregister_supplement(&messaging_supplement);
 	ast_msg_tech_unregister(&msg_tech);
 	ast_sip_unregister_service(&messaging_module);
+	ast_taskprocessor_unreference(message_serializer);
 	return 0;
 }
 

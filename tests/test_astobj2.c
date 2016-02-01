@@ -30,7 +30,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419175 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/utils.h"
 #include "asterisk/module.h"
@@ -2026,7 +2026,7 @@ AST_TEST_DEFINE(astobj2_test_perf)
 	switch (cmd) {
 	case TEST_INIT:
 		info->name = "astobj2_test_perf";
-		info->category = "/main/astobj2/perf";
+		info->category = "/main/astobj2/perf/";
 		info->summary = "Test container performance";
 		info->description =
 			"Runs container traversal tests.";

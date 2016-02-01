@@ -53,8 +53,8 @@ enum ast_fax_capabilities {
 enum ast_fax_modems {
 	/*! V.17 */
 	AST_FAX_MODEM_V17 = (1 << 0),
-	/*! V.27 */
-	AST_FAX_MODEM_V27 = (1 << 1),
+	/*! V.27ter */
+	AST_FAX_MODEM_V27TER = (1 << 1),
 	/*! V.29 */
 	AST_FAX_MODEM_V29 = (1 << 2),
 	/*! V.34 */
@@ -175,6 +175,8 @@ struct ast_fax_session_details {
 	struct ast_fax_t38_parameters our_t38_parameters;
 	/*! the other endpoint's T.38 session parameters, if any */
 	struct ast_fax_t38_parameters their_t38_parameters;
+	/*! T.38 negotiation in ms */
+	unsigned int t38timeout;
 	/*! the id of the t.38 gateway framehook for this channel */
 	int gateway_id;
 	/*! the timeout for this gateway in seconds */

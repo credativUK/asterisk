@@ -91,6 +91,8 @@ struct ast_sip_transport {
 	AST_DECLARE_STRING_FIELDS(
 		/*! Certificate of authority list file */
 		AST_STRING_FIELD(ca_list_file);
+		/*! Certificate of authority list path */
+		AST_STRING_FIELD(ca_list_path);
 		/*! Public certificate file */
 		AST_STRING_FIELD(cert_file);
 		/*! Optional private key of the certificate file */
@@ -164,6 +166,12 @@ struct ast_sip_contact {
 	unsigned int qualify_frequency;
 	/*! If true authenticate the qualify if needed */
 	int authenticate_qualify;
+	/*! Qualify timeout. 0 is diabled. */
+	double qualify_timeout;
+	/*! Endpoint that added the contact, only available in observers */
+	struct ast_sip_endpoint *endpoint;
+	/*! The name of the aor this contact belongs to */
+	char *aor;
 };
 
 #define CONTACT_STATUS "contact_status"
@@ -173,7 +181,10 @@ struct ast_sip_contact {
  */
 enum ast_sip_contact_status_type {
 	UNAVAILABLE,
-	AVAILABLE
+	AVAILABLE,
+	UNKNOWN,
+	CREATED,
+	REMOVED,
 };
 
 /*!
@@ -190,6 +201,12 @@ struct ast_sip_contact_status {
 	struct timeval rtt_start;
 	/*! The round trip time in microseconds */
 	int64_t rtt;
+	/*! Last status for a contact (default - unavailable) */
+	enum ast_sip_contact_status_type last_status;
+	/*! The name of the aor this contact_status belongs to */
+	char *aor;
+	/*! The original contact's URI */
+	char *uri;
 };
 
 /*!
@@ -222,6 +239,8 @@ struct ast_sip_aor {
 	struct ao2_container *permanent_contacts;
 	/*! Determines whether SIP Path headers are supported */
 	unsigned int support_path;
+	/*! Qualify timeout. 0 is diabled. */
+	double qualify_timeout;
 };
 
 /*!
@@ -250,6 +269,8 @@ enum ast_sip_dtmf_mode {
 	AST_SIP_DTMF_INBAND,
 	/*! Use SIP INFO DTMF (blech) */
 	AST_SIP_DTMF_INFO,
+	/*! Use SIP 4733 if supported by the other side or INBAND if not */
+	AST_SIP_DTMF_AUTO,
 };
 
 /*!
@@ -271,21 +292,21 @@ enum ast_sip_auth_type {
 #define SIP_SORCERY_AUTH_TYPE "auth"
 
 struct ast_sip_auth {
-	/* Sorcery ID of the auth is its name */
+	/*! Sorcery ID of the auth is its name */
 	SORCERY_OBJECT(details);
 	AST_DECLARE_STRING_FIELDS(
-		/* Identification for these credentials */
+		/*! Identification for these credentials */
 		AST_STRING_FIELD(realm);
-		/* Authentication username */
+		/*! Authentication username */
 		AST_STRING_FIELD(auth_user);
-		/* Authentication password */
+		/*! Authentication password */
 		AST_STRING_FIELD(auth_pass);
-		/* Authentication credentials in MD5 format (hash of user:realm:pass) */
+		/*! Authentication credentials in MD5 format (hash of user:realm:pass) */
 		AST_STRING_FIELD(md5_creds);
 	);
-	/* The time period (in seconds) that a nonce may be reused */
+	/*! The time period (in seconds) that a nonce may be reused */
 	unsigned int nonce_lifetime;
-	/* Used to determine what to use when authenticating */
+	/*! Used to determine what to use when authenticating */
 	enum ast_sip_auth_type type;
 };
 
@@ -485,6 +506,12 @@ struct ast_sip_media_rtp_configuration {
 	enum ast_sip_session_media_encryption encryption;
 	/*! Do we want to optimistically support encryption if possible? */
 	unsigned int encryption_optimistic;
+	/*! Number of seconds between RTP keepalive packets */
+	unsigned int keepalive;
+	/*! Number of seconds before terminating channel due to lack of RTP (when not on hold) */
+	unsigned int timeout;
+	/*! Number of seconds before terminating channel due to lack of RTP (when on hold) */
+	unsigned int timeout_hold;
 };
 
 /*!
@@ -542,6 +569,8 @@ struct ast_sip_endpoint_media_configuration {
 	unsigned int tos_video;
 	/*! Priority for video streams */
 	unsigned int cos_video;
+	/*! Is g.726 packed in a non standard way */
+	unsigned int g726_non_standard;
 };
 
 /*!
@@ -609,6 +638,10 @@ struct ast_sip_endpoint {
 	enum ast_sip_session_redirect redirect_method;
 	/*! Variables set on channel creation */
 	struct ast_variable *channel_vars;
+	/*! Whether to place a 'user=phone' parameter into the request URI if user is a number */
+	unsigned int usereqphone;
+	/*! Do we send messages for connected line updates for unanswered incoming calls immediately to this endpoint? */
+	unsigned int rpid_immediate;
 };
 
 /*!
@@ -687,6 +720,18 @@ struct ast_sip_outbound_authenticator {
 	 */
 	int (*create_request_with_auth)(const struct ast_sip_auth_vector *auths, struct pjsip_rx_data *challenge,
 			struct pjsip_transaction *tsx, struct pjsip_tx_data **new_request);
+	/*!
+	 * \brief Create a new request with authentication credentials based on old request
+	 *
+	 * \param auths A vector of IDs of auth sorcery objects
+	 * \param challenge The SIP response with authentication challenge(s)
+	 * \param old_request The request that resulted in challenge(s)
+	 * \param new_request The new SIP request with challenge response(s)
+	 * \retval 0 Successfully created new request
+	 * \retval -1 Failed to create a new request
+	 */
+	int (*create_request_with_auth_from_old)(const struct ast_sip_auth_vector *auths, struct pjsip_rx_data *challenge,
+			struct pjsip_tx_data *old_request, struct pjsip_tx_data **new_request);
 };
 
 /*!
@@ -774,6 +819,23 @@ int ast_sip_register_outbound_authenticator(struct ast_sip_outbound_authenticato
 void ast_sip_unregister_outbound_authenticator(struct ast_sip_outbound_authenticator *auth);
 
 /*!
+ * \brief Register a SIP endpoint identifier with a name.
+ *
+ * An endpoint identifier's purpose is to determine which endpoint a given SIP
+ * message has come from.
+ *
+ * Multiple endpoint identifiers may be registered so that if an endpoint
+ * cannot be identified by one identifier, it may be identified by another.
+ *
+ * \param identifier The SIP endpoint identifier to register
+ * \param name The name of the endpoint identifier
+ * \retval 0 Success
+ * \retval -1 Failure
+ */
+int ast_sip_register_endpoint_identifier_with_name(struct ast_sip_endpoint_identifier *identifier,
+						   const char *name);
+
+/*!
  * \brief Register a SIP endpoint identifier
  *
  * An endpoint identifier's purpose is to determine which endpoint a given SIP
@@ -789,6 +851,10 @@ void ast_sip_unregister_outbound_authenticator(struct ast_sip_outbound_authentic
  * If the order in which endpoint identifiers is run is important to you, then
  * be sure to load individual endpoint identifier modules in the order you wish
  * for them to be run in modules.conf
+ *
+ * \note endpoint identifiers registered using this method (no name specified)
+ *       are placed at the front of the endpoint identifiers list ahead of any
+ *       named identifiers.
  *
  * \param identifier The SIP endpoint identifier to register
  * \retval 0 Success
@@ -836,46 +902,6 @@ pjsip_endpoint *ast_sip_get_pjsip_endpoint(void);
 struct ast_sorcery *ast_sip_get_sorcery(void);
 
 /*!
- * \brief Initialize transport support on a sorcery instance
- *
- * \retval -1 failure
- * \retval 0 success
- */
-int ast_sip_initialize_sorcery_transport(void);
-
-/*!
- * \brief Destroy transport support on a sorcery instance
- *
- * \retval -1 failure
- * \retval 0 success
- */
-int ast_sip_destroy_sorcery_transport(void);
-
-/*!
- * \brief Initialize qualify support on a sorcery instance
- *
- * \retval -1 failure
- * \retval 0 success
- */
-int ast_sip_initialize_sorcery_qualify(void);
-
-/*!
- * \brief Initialize location support on a sorcery instance
- *
- * \retval -1 failure
- * \retval 0 success
- */
-int ast_sip_initialize_sorcery_location(void);
-
-/*!
- * \brief Destroy location support on a sorcery instance
- *
- * \retval -1 failure
- * \retval 0 success
- */
-int ast_sip_destroy_sorcery_location(void);
-
-/*!
  * \brief Retrieve a named AOR
  *
  * \param aor_name Name of the AOR
@@ -914,6 +940,25 @@ struct ao2_container *ast_sip_location_retrieve_aor_contacts(const struct ast_si
 struct ast_sip_contact *ast_sip_location_retrieve_contact_from_aor_list(const char *aor_list);
 
 /*!
+ * \brief Retrieve all contacts from a list of AORs
+ *
+ * \param aor_list A comma-separated list of AOR names
+ * \retval NULL if no contacts available
+ * \retval non-NULL container (which must be freed) if contacts available
+ */
+struct ao2_container *ast_sip_location_retrieve_contacts_from_aor_list(const char *aor_list);
+
+/*!
+ * \brief Retrieve the first bound contact AND the AOR chosen from a list of AORs
+ *
+ * \param aor_list A comma-separated list of AOR names
+ * \param aor The chosen AOR
+ * \param contact The chosen contact
+ */
+ void ast_sip_location_retrieve_contact_and_aor_from_list(const char *aor_list, struct ast_sip_aor **aor,
+	struct ast_sip_contact **contact);
+
+/*!
  * \brief Retrieve a named contact
  *
  * \param contact_name Name of the contact
@@ -931,12 +976,14 @@ struct ast_sip_contact *ast_sip_location_retrieve_contact(const char *contact_na
  * \param expiration_time Optional expiration time of the contact
  * \param path_info Path information
  * \param user_agent User-Agent header from REGISTER request
+ * \param endpoint The endpoint that resulted in the contact being added
  *
  * \retval -1 failure
  * \retval 0 success
  */
 int ast_sip_location_add_contact(struct ast_sip_aor *aor, const char *uri,
-	struct timeval expiration_time, const char *path_info, const char *user_agent);
+	struct timeval expiration_time, const char *path_info, const char *user_agent,
+	struct ast_sip_endpoint *endpoint);
 
 /*!
  * \brief Update a contact
@@ -957,30 +1004,6 @@ int ast_sip_location_update_contact(struct ast_sip_contact *contact);
 * \retval 0 success
 */
 int ast_sip_location_delete_contact(struct ast_sip_contact *contact);
-
-/*!
- * \brief Initialize domain aliases support on a sorcery instance
- *
- * \retval -1 failure
- * \retval 0 success
- */
-int ast_sip_initialize_sorcery_domain_alias(void);
-
-/*!
- * \brief Initialize authentication support on a sorcery instance
- *
- * \retval -1 failure
- * \retval 0 success
- */
-int ast_sip_initialize_sorcery_auth(void);
-
-/*!
- * \brief Destroy authentication support on a sorcery instance
- *
- * \retval -1 failure
- * \retval 0 success
- */
-int ast_sip_destroy_sorcery_auth(void);
 
 /*!
  * \brief Callback called when an outbound request with authentication credentials is to be sent in dialog
@@ -1016,26 +1039,6 @@ typedef int (*ast_sip_dialog_outbound_auth_cb)(pjsip_dialog *dlg, pjsip_tx_data 
  */
 int ast_sip_dialog_setup_outbound_authentication(pjsip_dialog *dlg, const struct ast_sip_endpoint *endpoint,
 		ast_sip_dialog_outbound_auth_cb cb, void *user_data);
-
-/*!
- * \brief Initialize the distributor module
- *
- * The distributor module is responsible for taking an incoming
- * SIP message and placing it into the threadpool. Once in the threadpool,
- * the distributor will perform endpoint lookups and authentication, and
- * then distribute the message up the stack to any further modules.
- *
- * \retval -1 Failure
- * \retval 0 Success
- */
-int ast_sip_initialize_distributor(void);
-
-/*!
- * \brief Destruct the distributor module.
- *
- * Unregisters pjsip modules and cleans up any allocated resources.
- */
-void ast_sip_destroy_distributor(void);
 
 /*!
  * \brief Retrieves a reference to the artificial auth.
@@ -1121,6 +1124,23 @@ struct ast_sip_endpoint *ast_sip_get_artificial_endpoint(void);
  */
 struct ast_taskprocessor *ast_sip_create_serializer(void);
 
+struct ast_serializer_shutdown_group;
+
+/*!
+ * \brief Create a new serializer for SIP tasks
+ * \since 13.5.0
+ *
+ * See \ref ast_threadpool_serializer for more information on serializers.
+ * SIP creates serializers so that tasks operating on similar data will run
+ * in sequence.
+ *
+ * \param shutdown_group Group shutdown controller. (NULL if no group association)
+ *
+ * \retval NULL Failure
+ * \retval non-NULL Newly-created serializer
+ */
+struct ast_taskprocessor *ast_sip_create_serializer_group(struct ast_serializer_shutdown_group *shutdown_group);
+
 /*!
  * \brief Set a serializer on a SIP dialog so requests and responses are automatically serialized
  *
@@ -1175,6 +1195,11 @@ int ast_sip_push_task(struct ast_taskprocessor *serializer, int (*sip_task)(void
  * \warning \b Never use this function in a SIP servant thread. This can potentially
  * cause a deadlock. If you are in a SIP servant thread, just call your function
  * in-line.
+ *
+ * \warning \b Never hold locks that may be acquired by a SIP servant thread when
+ * calling this function. Doing so may cause a deadlock if all SIP servant threads
+ * are blocked waiting to acquire the lock while the thread holding the lock is
+ * waiting for a free SIP servant thread.
  *
  * \param serializer The SIP serializer to which the task belongs. May be NULL.
  * \param sip_task The task to execute
@@ -1303,6 +1328,37 @@ int ast_sip_send_request(pjsip_tx_data *tdata, struct pjsip_dialog *dlg,
 	void (*callback)(void *token, pjsip_event *e));
 
 /*!
+ * \brief General purpose method for sending an Out-Of-Dialog SIP request
+ *
+ * This is a companion function for \ref ast_sip_create_request. The request
+ * created there can be passed to this function, though any request may be
+ * passed in.
+ *
+ * This will automatically set up handling outbound authentication challenges if
+ * they arrive.
+ *
+ * \param tdata The request to send
+ * \param endpoint Optional. If specified, the out-of-dialog request is sent to the endpoint.
+ * \param timeout.  If non-zero, after the timeout the transaction will be terminated
+ * and the callback will be called with the PJSIP_EVENT_TIMER type.
+ * \param token Data to be passed to the callback upon receipt of out-of-dialog response.
+ * \param callback Callback to be called upon receipt of out-of-dialog response.
+ *
+ * \retval 0 Success
+ * \retval -1 Failure (out-of-dialog callback will not be called.)
+ *
+ * \note Timeout processing:
+ * There are 2 timers associated with this request, PJSIP timer_b which is
+ * set globally in the "system" section of pjsip.conf, and the timeout specified
+ * on this call.  The timer that expires first (before normal completion) will
+ * cause the callback to be run with e->body.tsx_state.type = PJSIP_EVENT_TIMER.
+ * The timer that expires second is simply ignored and the callback is not run again.
+ */
+int ast_sip_send_out_of_dialog_request(pjsip_tx_data *tdata,
+	struct ast_sip_endpoint *endpoint, int timeout, void *token,
+	void (*callback)(void *token, pjsip_event *e));
+
+/*!
  * \brief General purpose method for creating a SIP response
  *
  * Its typical use would be to create responses for out of dialog
@@ -1326,6 +1382,11 @@ int ast_sip_create_response(const pjsip_rx_data *rdata, int st_code,
 /*!
  * \brief Send a response to an out of dialog request
  *
+ * Use this function sparingly, since this does not create a transaction
+ * within PJSIP. This means that if the request is retransmitted, it is
+ * your responsibility to detect this and not process the same request
+ * twice, and to send the same response for each retransmission.
+ *
  * \param res_addr The response address for this response
  * \param tdata The response to send
  * \param endpoint The ast_sip_endpoint associated with this response
@@ -1334,6 +1395,24 @@ int ast_sip_create_response(const pjsip_rx_data *rdata, int st_code,
  * \retval -1 Failure
  */
 int ast_sip_send_response(pjsip_response_addr *res_addr, pjsip_tx_data *tdata, struct ast_sip_endpoint *sip_endpoint);
+
+/*!
+ * \brief Send a stateful response to an out of dialog request
+ *
+ * This creates a transaction within PJSIP, meaning that if the request
+ * that we are responding to is retransmitted, we will not attempt to
+ * re-handle the request.
+ *
+ * \param rdata The request that is being responded to
+ * \param tdata The response to send
+ * \param endpoint The ast_sip_endpoint associated with this response
+ *
+ * \since 13.4.0
+ *
+ * \retval 0 Success
+ * \retval -1 Failure
+ */
+int ast_sip_send_stateful_response(pjsip_rx_data *rdata, pjsip_tx_data *tdata, struct ast_sip_endpoint *sip_endpoint);
 
 /*!
  * \brief Determine if an incoming request requires authentication
@@ -1377,6 +1456,17 @@ enum ast_sip_check_auth_result ast_sip_check_authentication(struct ast_sip_endpo
  */
 int ast_sip_create_request_with_auth(const struct ast_sip_auth_vector *auths, pjsip_rx_data *challenge,
 		pjsip_transaction *tsx, pjsip_tx_data **new_request);
+
+/*!
+ * \brief Create a response to an authentication challenge
+ *
+ * This will call into an outbound authenticator's create_request_with_auth callback
+ * to create a new request with authentication credentials. See the create_request_with_auth_from_old
+ * callback in the \ref ast_sip_outbound_authenticator structure for details about
+ * the parameters and return values.
+ */
+int ast_sip_create_request_with_auth_from_old(const struct ast_sip_auth_vector *auths, pjsip_rx_data *challenge,
+		pjsip_tx_data *old_request, pjsip_tx_data **new_request);
 
 /*!
  * \brief Determine the endpoint that has sent a SIP message
@@ -1487,6 +1577,15 @@ void ast_copy_pj_str(char *dest, const pj_str_t *src, size_t size);
 struct ast_sip_endpoint *ast_pjsip_rdata_get_endpoint(pjsip_rx_data *rdata);
 
 /*!
+ * \brief Add 'user=phone' parameter to URI if enabled and user is a phone number.
+ *
+ * \param endpoint The endpoint to use for configuration
+ * \param pool The memory pool to allocate the parameter from
+ * \param uri The URI to check for user and to add parameter to
+ */
+void ast_sip_add_usereqphone(const struct ast_sip_endpoint *endpoint, pj_pool_t *pool, pjsip_uri *uri);
+
+/*!
  * \brief Retrieve any endpoints available to sorcery.
  *
  * \retval Endpoints available to sorcery, NULL if no endpoints found.
@@ -1594,13 +1693,8 @@ void ast_sip_report_req_no_support(struct ast_sip_endpoint *endpoint, pjsip_rx_d
  */
 void ast_sip_report_mem_limit(struct ast_sip_endpoint *endpoint, pjsip_rx_data *rdata);
 
-void ast_sip_initialize_global_headers(void);
-void ast_sip_destroy_global_headers(void);
-
 int ast_sip_add_global_request_header(const char *name, const char *value, int replace);
 int ast_sip_add_global_response_header(const char *name, const char *value, int replace);
-
-int ast_sip_initialize_sorcery_global(void);
 
 /*!
  * \brief Retrieves the value associated with the given key.
@@ -1718,7 +1812,7 @@ const char *ast_sip_auth_type_to_str(enum ast_sip_auth_type type);
  */
 int ast_sip_auths_to_str(const struct ast_sip_auth_vector *auths, char **buf);
 
-/*
+/*!
  * \brief AMI variable container
  */
 struct ast_sip_ami {
@@ -1947,6 +2041,28 @@ void ast_sip_unregister_supplement(struct ast_sip_supplement *supplement);
  */
 char *ast_sip_get_debug(void);
 
+/*!
+ * \brief Retrieve the global endpoint_identifier_order setting.
+ *
+ * Specifies the order by which endpoint identifiers should be regarded.
+ *
+ * \retval the global endpoint_identifier_order value
+ */
+char *ast_sip_get_endpoint_identifier_order(void);
+
+/*!
+ * \brief Retrieve the global default from user.
+ *
+ * This is the value placed in outbound requests' From header if there
+ * is no better option (such as an endpoint-configured from_user or
+ * caller ID number).
+ *
+ * \param[out] from_user The default from user
+ * \param size The buffer size of from_user
+ * \return nothing
+ */
+void ast_sip_get_default_from_user(char *from_user, size_t size);
+
 /*! \brief Determines whether the res_pjsip module is loaded */
 #define CHECK_PJSIP_MODULE_LOADED()				\
 	do {							\
@@ -1955,5 +2071,61 @@ char *ast_sip_get_debug(void);
 			return AST_MODULE_LOAD_DECLINE;		\
 		}						\
 	} while(0)
+
+/*!
+ * \brief Retrieve the system keep alive interval setting.
+ *
+ * \retval the keep alive interval.
+ */
+unsigned int ast_sip_get_keep_alive_interval(void);
+
+/*!
+ * \brief Retrieve the system max initial qualify time.
+ *
+ * \retval the maximum initial qualify time.
+ */
+unsigned int ast_sip_get_max_initial_qualify_time(void);
+
+/*!
+ * \brief translate ast_sip_contact_status_type to character string.
+ *
+ * \retval the character string equivalent.
+ */
+
+const char *ast_sip_get_contact_status_label(const enum ast_sip_contact_status_type status);
+const char *ast_sip_get_contact_short_status_label(const enum ast_sip_contact_status_type status);
+
+/*!
+ * \brief Retrieve the local host address in IP form
+ *
+ * \param af The address family to retrieve
+ * \param addr A place to store the local host address
+ *
+ * \retval 0 success
+ * \retval -1 failure
+ *
+ * \since 13.6.0
+ */
+int ast_sip_get_host_ip(int af, pj_sockaddr *addr);
+
+/*!
+ * \brief Retrieve the local host address in string form
+ *
+ * \param af The address family to retrieve
+ *
+ * \retval non-NULL success
+ * \retval NULL failure
+ *
+ * \since 13.6.0
+ *
+ * \note An empty string may be returned if the address family is valid but no local address exists
+ */
+const char *ast_sip_get_host_ip_string(int af);
+
+/*!
+ * \brief Return the size of the SIP threadpool's task queue
+ * \since 13.7.0
+ */
+long ast_sip_threadpool_queue_size(void);
 
 #endif /* _RES_PJSIP_H */

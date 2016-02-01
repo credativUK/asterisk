@@ -37,6 +37,7 @@
 #include "asterisk/framehook.h"
 #include "asterisk/stasis_bridges.h"
 #include "asterisk/stasis_channels.h"
+#include "asterisk/causes.h"
 
 /*! \brief REFER Progress structure */
 struct refer_progress {
@@ -242,15 +243,15 @@ static struct ast_frame *refer_progress_framehook(struct ast_channel *chan, stru
 
 	/* If a notification is due to be sent push it to the thread pool */
 	if (notification) {
-		if (ast_sip_push_task(progress->serializer, refer_progress_notify, notification)) {
-			ao2_cleanup(notification);
-		}
-
 		/* If the subscription is being terminated we don't need the frame hook any longer */
 		if (notification->state == PJSIP_EVSUB_STATE_TERMINATED) {
 			ast_debug(3, "Detaching REFER progress monitoring hook from '%s' as subscription is being terminated\n",
 				ast_channel_name(chan));
 			ast_framehook_detach(chan, progress->framehook);
+		}
+
+		if (ast_sip_push_task(progress->serializer, refer_progress_notify, notification)) {
+			ao2_cleanup(notification);
 		}
 	}
 
@@ -407,7 +408,7 @@ struct refer_attended {
 	/*! \brief Transferer channel */
 	struct ast_channel *transferer_chan;
 	/*! \brief Second transferer session */
-	struct ast_sip_session *transferer_second	;
+	struct ast_sip_session *transferer_second;
 	/*! \brief Optional refer progress structure */
 	struct refer_progress *progress;
 };
@@ -418,16 +419,20 @@ static void refer_attended_destroy(void *obj)
 	struct refer_attended *attended = obj;
 
 	ao2_cleanup(attended->transferer);
-	ast_channel_unref(attended->transferer_chan);
+	ast_channel_cleanup(attended->transferer_chan);
 	ao2_cleanup(attended->transferer_second);
+	ao2_cleanup(attended->progress);
 }
 
 /*! \brief Allocator for attended transfer task */
-static struct refer_attended *refer_attended_alloc(struct ast_sip_session *transferer, struct ast_sip_session *transferer_second,
+static struct refer_attended *refer_attended_alloc(struct ast_sip_session *transferer,
+	struct ast_sip_session *transferer_second,
 	struct refer_progress *progress)
 {
-	struct refer_attended *attended = ao2_alloc(sizeof(*attended), refer_attended_destroy);
+	struct refer_attended *attended;
 
+	attended = ao2_alloc_options(sizeof(*attended), refer_attended_destroy,
+		AO2_ALLOC_OPT_LOCK_NOLOCK);
 	if (!attended) {
 		return NULL;
 	}
@@ -447,20 +452,30 @@ static struct refer_attended *refer_attended_alloc(struct ast_sip_session *trans
 	return attended;
 }
 
-/*! \brief Task for attended transfer */
-static int refer_attended(void *data)
+static int defer_termination_cancel(void *data)
 {
-	RAII_VAR(struct refer_attended *, attended, data, ao2_cleanup);
-	int response = 0;
+	struct ast_sip_session *session = data;
 
-	if (!attended->transferer_second->channel) {
-		return -1;
-	}
+	ast_sip_session_defer_termination_cancel(session);
+	ao2_ref(session, -1);
+	return 0;
+}
 
-	ast_debug(3, "Performing a REFER attended transfer - Transferer #1: %s Transferer #2: %s\n",
-		ast_channel_name(attended->transferer_chan), ast_channel_name(attended->transferer_second->channel));
+/*!
+ * \internal
+ * \brief Convert transfer enum to SIP response code.
+ * \since 13.3.0
+ *
+ * \param xfer_code Core transfer function enum result.
+ *
+ * \return SIP response code
+ */
+static int xfer_response_code2sip(enum ast_transfer_result xfer_code)
+{
+	int response;
 
-	switch (ast_bridge_transfer_attended(attended->transferer_chan, attended->transferer_second->channel)) {
+	response = 503;
+	switch (xfer_code) {
 	case AST_BRIDGE_TRANSFER_INVALID:
 		response = 400;
 		break;
@@ -472,21 +487,55 @@ static int refer_attended(void *data)
 		break;
 	case AST_BRIDGE_TRANSFER_SUCCESS:
 		response = 200;
-		ast_sip_session_defer_termination(attended->transferer);
 		break;
 	}
+	return response;
+}
 
-	ast_debug(3, "Final response for REFER attended transfer - Transferer #1: %s Transferer #2: %s is '%d'\n",
-		ast_channel_name(attended->transferer_chan), ast_channel_name(attended->transferer_second->channel), response);
+/*! \brief Task for attended transfer executed by attended->transferer_second serializer */
+static int refer_attended_task(void *data)
+{
+	struct refer_attended *attended = data;
+	int response;
 
-	if (attended->progress && response) {
-		struct refer_progress_notification *notification = refer_progress_notification_alloc(attended->progress, response, PJSIP_EVSUB_STATE_TERMINATED);
+	if (attended->transferer_second->channel) {
+		ast_debug(3, "Performing a REFER attended transfer - Transferer #1: %s Transferer #2: %s\n",
+			ast_channel_name(attended->transferer_chan),
+			ast_channel_name(attended->transferer_second->channel));
 
+		response = xfer_response_code2sip(ast_bridge_transfer_attended(
+			attended->transferer_chan,
+			attended->transferer_second->channel));
+
+		ast_debug(3, "Final response for REFER attended transfer - Transferer #1: %s Transferer #2: %s is '%d'\n",
+			ast_channel_name(attended->transferer_chan),
+			ast_channel_name(attended->transferer_second->channel),
+			response);
+	} else {
+		ast_debug(3, "Received REFER request on channel '%s' but other channel has gone.\n",
+			ast_channel_name(attended->transferer_chan));
+		response = 603;
+	}
+
+	if (attended->progress) {
+		struct refer_progress_notification *notification;
+
+		notification = refer_progress_notification_alloc(attended->progress, response,
+			PJSIP_EVSUB_STATE_TERMINATED);
 		if (notification) {
 			refer_progress_notify(notification);
 		}
 	}
 
+	if (response != 200) {
+		if (!ast_sip_push_task(attended->transferer->serializer,
+			defer_termination_cancel, attended->transferer)) {
+			/* Gave the ref to the pushed task. */
+			attended->transferer = NULL;
+		}
+	}
+
+	ao2_ref(attended, -1);
 	return 0;
 }
 
@@ -599,9 +648,16 @@ static void refer_blind_callback(struct ast_channel *chan, struct transfer_chann
 
 	if (refer->replaces) {
 		char replaces[512];
+		char *replaces_val = NULL;
+		int len;
 
-		pjsip_hdr_print_on(refer->replaces, replaces, sizeof(replaces));
-		pbx_builtin_setvar_helper(chan, "__SIPREPLACESHDR", S_OR(replaces, NULL));
+		len = pjsip_hdr_print_on(refer->replaces, replaces, sizeof(replaces) - 1);
+		if (len != -1) {
+			/* pjsip_hdr_print_on does not NULL terminate the buffer */
+			replaces[len] = '\0';
+			replaces_val = replaces + sizeof("Replaces:");
+		}
+		pbx_builtin_setvar_helper(chan, "__SIPREPLACESHDR", replaces_val);
 	} else {
 		pbx_builtin_setvar_helper(chan, "SIPREPLACESHDR", NULL);
 	}
@@ -615,6 +671,26 @@ static void refer_blind_callback(struct ast_channel *chan, struct transfer_chann
 		pbx_builtin_setvar_helper(chan, "SIPREFERTOHDR", NULL);
 	}
 }
+
+/*!
+ * \internal
+ * \brief Set the passed in context variable to the determined transfer context.
+ * \since 13.3.0
+ *
+ * \param context Set to the determined transfer context.
+ * \param session INVITE dialog SIP session.
+ */
+#define DETERMINE_TRANSFER_CONTEXT(context, session)									\
+	do {																				\
+		ast_channel_lock((session)->channel);											\
+		context = pbx_builtin_getvar_helper((session)->channel, "TRANSFER_CONTEXT");	\
+		if (ast_strlen_zero(context)) {													\
+			context = (session)->endpoint->context;										\
+		} else {																		\
+			context = ast_strdupa(context);												\
+		}																				\
+		ast_channel_unlock((session)->channel);											\
+	} while (0)																			\
 
 static int refer_incoming_attended_request(struct ast_sip_session *session, pjsip_rx_data *rdata, pjsip_sip_uri *target_uri,
 	pjsip_param *replaces_param, struct refer_progress *progress)
@@ -655,8 +731,16 @@ static int refer_incoming_attended_request(struct ast_sip_session *session, pjsi
 			return 500;
 		}
 
+		if (ast_sip_session_defer_termination(session)) {
+			ast_log(LOG_ERROR, "Received REFER request on channel '%s' from endpoint '%s' for local dialog but could not defer termination, rejecting\n",
+				ast_channel_name(session->channel), ast_sorcery_object_get_id(session->endpoint));
+			ao2_cleanup(attended);
+			return 500;
+		}
+
 		/* Push it to the other session, which will have both channels with minimal locking */
-		if (ast_sip_push_task(other_session->serializer, refer_attended, attended)) {
+		if (ast_sip_push_task(other_session->serializer, refer_attended_task, attended)) {
+			ast_sip_session_defer_termination_cancel(session);
 			ao2_cleanup(attended);
 			return 500;
 		}
@@ -666,16 +750,15 @@ static int refer_incoming_attended_request(struct ast_sip_session *session, pjsi
 
 		return 200;
 	} else {
-		const char *context = (session->channel ? pbx_builtin_getvar_helper(session->channel, "TRANSFER_CONTEXT") : "");
+		const char *context;
 		struct refer_blind refer = { 0, };
+		int response;
 
-		if (ast_strlen_zero(context)) {
-			context = session->endpoint->context;
-		}
+		DETERMINE_TRANSFER_CONTEXT(context, session);
 
 		if (!ast_exists_extension(NULL, context, "external_replaces", 1, NULL)) {
-			ast_log(LOG_ERROR, "Received REFER for remote session on channel '%s' from endpoint '%s' but 'external_replaces' context does not exist for handling\n",
-				ast_channel_name(session->channel), ast_sorcery_object_get_id(session->endpoint));
+			ast_log(LOG_ERROR, "Received REFER for remote session on channel '%s' from endpoint '%s' but 'external_replaces' extension not found in context %s\n",
+				ast_channel_name(session->channel), ast_sorcery_object_get_id(session->endpoint), context);
 			return 404;
 		}
 
@@ -685,22 +768,20 @@ static int refer_incoming_attended_request(struct ast_sip_session *session, pjsi
 		refer.replaces = replaces;
 		refer.refer_to = target_uri;
 
-		switch (ast_bridge_transfer_blind(1, session->channel, "external_replaces", context, refer_blind_callback, &refer)) {
-		case AST_BRIDGE_TRANSFER_INVALID:
-			return 400;
-		case AST_BRIDGE_TRANSFER_NOT_PERMITTED:
-			return 403;
-		case AST_BRIDGE_TRANSFER_FAIL:
+		if (ast_sip_session_defer_termination(session)) {
+			ast_log(LOG_ERROR, "Received REFER for remote session on channel '%s' from endpoint '%s' but could not defer termination, rejecting\n",
+				ast_channel_name(session->channel),
+				ast_sorcery_object_get_id(session->endpoint));
 			return 500;
-		case AST_BRIDGE_TRANSFER_SUCCESS:
-			ast_sip_session_defer_termination(session);
-			return 200;
 		}
 
-		return 503;
+		response = xfer_response_code2sip(ast_bridge_transfer_blind(1, session->channel,
+			"external_replaces", context, refer_blind_callback, &refer));
+		if (response != 200) {
+			ast_sip_session_defer_termination_cancel(session);
+		}
+		return response;
 	}
-
-	return 0;
 }
 
 static int refer_incoming_blind_request(struct ast_sip_session *session, pjsip_rx_data *rdata, pjsip_sip_uri *target,
@@ -709,16 +790,10 @@ static int refer_incoming_blind_request(struct ast_sip_session *session, pjsip_r
 	const char *context;
 	char exten[AST_MAX_EXTENSION];
 	struct refer_blind refer = { 0, };
-
-	if (!session->channel) {
-		return 404;
-	}
+	int response;
 
 	/* If no explicit transfer context has been provided use their configured context */
-	context = pbx_builtin_getvar_helper(session->channel, "TRANSFER_CONTEXT");
-	if (ast_strlen_zero(context)) {
-		context = session->endpoint->context;
-	}
+	DETERMINE_TRANSFER_CONTEXT(context, session);
 
 	/* Using the user portion of the target URI see if it exists as a valid extension in their context */
 	ast_copy_pj_str(exten, &target->user, sizeof(exten));
@@ -733,19 +808,19 @@ static int refer_incoming_blind_request(struct ast_sip_session *session, pjsip_r
 	refer.rdata = rdata;
 	refer.refer_to = target;
 
-	switch (ast_bridge_transfer_blind(1, session->channel, exten, context, refer_blind_callback, &refer)) {
-	case AST_BRIDGE_TRANSFER_INVALID:
-		return 400;
-	case AST_BRIDGE_TRANSFER_NOT_PERMITTED:
-		return 403;
-	case AST_BRIDGE_TRANSFER_FAIL:
+	if (ast_sip_session_defer_termination(session)) {
+		ast_log(LOG_ERROR, "Channel '%s' from endpoint '%s' attempted blind transfer but could not defer termination, rejecting\n",
+			ast_channel_name(session->channel),
+			ast_sorcery_object_get_id(session->endpoint));
 		return 500;
-	case AST_BRIDGE_TRANSFER_SUCCESS:
-		ast_sip_session_defer_termination(session);
-		return 200;
 	}
 
-	return 503;
+	response = xfer_response_code2sip(ast_bridge_transfer_blind(1, session->channel,
+		exten, context, refer_blind_callback, &refer));
+	if (response != 200) {
+		ast_sip_session_defer_termination_cancel(session);
+	}
+	return response;
 }
 
 /*! \brief Structure used to retrieve channel from another session */
@@ -788,8 +863,9 @@ static int refer_incoming_invite_request(struct ast_sip_session *session, struct
 	/* If a Replaces header is present make sure it is valid */
 	if (pjsip_replaces_verify_request(rdata, &other_dlg, PJ_TRUE, &packet) != PJ_SUCCESS) {
 		response = packet->msg->line.status.code;
+		ast_assert(response != 0);
 		pjsip_tx_data_dec_ref(packet);
-		goto end;
+		goto inv_replace_failed;
 	}
 
 	/* If no other dialog exists then this INVITE request does not have a Replaces header */
@@ -803,21 +879,21 @@ static int refer_incoming_invite_request(struct ast_sip_session *session, struct
 	/* Don't accept an in-dialog INVITE with Replaces as it does not make much sense */
 	if (session->inv_session->dlg->state == PJSIP_DIALOG_STATE_ESTABLISHED) {
 		response = 488;
-		goto end;
+		goto inv_replace_failed;
 	}
 
 	if (!other_session) {
-		response = 481;
 		ast_debug(3, "INVITE with Replaces received on channel '%s' from endpoint '%s', but requested session does not exist\n",
 			ast_channel_name(session->channel), ast_sorcery_object_get_id(session->endpoint));
-		goto end;
+		response = 481;
+		goto inv_replace_failed;
 	}
 
 	invite.session = other_session;
 
 	if (ast_sip_push_task_synchronous(other_session->serializer, invite_replaces, &invite)) {
 		response = 481;
-		goto end;
+		goto inv_replace_failed;
 	}
 
 	ast_channel_lock(session->channel);
@@ -825,48 +901,69 @@ static int refer_incoming_invite_request(struct ast_sip_session *session, struct
 	ast_channel_unlock(session->channel);
 	ast_raw_answer(session->channel);
 
+	ast_debug(3, "INVITE with Replaces being attempted.  '%s' --> '%s'\n",
+		ast_channel_name(session->channel), ast_channel_name(invite.channel));
+
 	if (!invite.bridge) {
 		struct ast_channel *chan = session->channel;
 
-		/* This will use a synchronous task but we aren't operating in the serializer at this point in time, so it
-		 * won't deadlock */
-		if (!ast_channel_move(invite.channel, session->channel)) {
+		/*
+		 * This will use a synchronous task but we aren't operating in
+		 * the serializer at this point in time, so it won't deadlock.
+		 */
+		if (!ast_channel_move(invite.channel, chan)) {
+			/*
+			 * We can't directly use session->channel because ast_channel_move()
+			 * does a masquerade which changes session->channel to a different
+			 * channel.  To ensure we work on the right channel we store a
+			 * pointer locally before we begin so it remains valid.
+			 */
 			ast_hangup(chan);
 		} else {
-			response = 500;
+			response = AST_CAUSE_FAILURE;
 		}
 	} else {
 		if (ast_bridge_impart(invite.bridge, session->channel, invite.channel, NULL,
 			AST_BRIDGE_IMPART_CHAN_INDEPENDENT)) {
-			response = 500;
+			response = AST_CAUSE_FAILURE;
 		}
-	}
-
-	if (!response) {
-		ast_debug(3, "INVITE with Replaces successfully completed on channels '%s' and '%s'\n",
-			ast_channel_name(session->channel), ast_channel_name(invite.channel));
 	}
 
 	ast_channel_unref(invite.channel);
 	ao2_cleanup(invite.bridge);
 
-end:
-	if (response) {
-		if (session->inv_session->dlg->state != PJSIP_DIALOG_STATE_ESTABLISHED) {
-			ast_debug(3, "INVITE with Replaces failed on channel '%s', sending response of '%d'\n",
-				ast_channel_name(session->channel), response);
-			session->defer_terminate = 1;
-			ast_hangup(session->channel);
-			session->channel = NULL;
+	if (!response) {
+		/*
+		 * On success we cannot use session->channel in the debug message.
+		 * This thread either no longer has a ref to session->channel or
+		 * session->channel is no longer the original channel.
+		 */
+		ast_debug(3, "INVITE with Replaces successfully completed.\n");
+	} else {
+		ast_debug(3, "INVITE with Replaces failed on channel '%s', hanging up with cause '%d'\n",
+			ast_channel_name(session->channel), response);
+		ast_channel_lock(session->channel);
+		ast_channel_hangupcause_set(session->channel, response);
+		ast_channel_unlock(session->channel);
+		ast_hangup(session->channel);
+	}
 
-			if (pjsip_inv_end_session(session->inv_session, response, NULL, &packet) == PJ_SUCCESS) {
-				ast_sip_session_send_response(session, packet);
-			}
-		} else {
-			ast_debug(3, "INVITE with Replaces in-dialog on channel '%s', hanging up\n",
-				ast_channel_name(session->channel));
-			ast_queue_hangup(session->channel);
+	return 1;
+
+inv_replace_failed:
+	if (session->inv_session->dlg->state != PJSIP_DIALOG_STATE_ESTABLISHED) {
+		ast_debug(3, "INVITE with Replaces failed on channel '%s', sending response of '%d'\n",
+			ast_channel_name(session->channel), response);
+		session->defer_terminate = 1;
+		ast_hangup(session->channel);
+
+		if (pjsip_inv_end_session(session->inv_session, response, NULL, &packet) == PJ_SUCCESS) {
+			ast_sip_session_send_response(session, packet);
 		}
+	} else {
+		ast_debug(3, "INVITE with Replaces in-dialog on channel '%s', hanging up\n",
+			ast_channel_name(session->channel));
+		ast_queue_hangup(session->channel);
 	}
 
 	return 1;
@@ -884,6 +981,14 @@ static int refer_incoming_refer_request(struct ast_sip_session *session, struct 
 
 	static const pj_str_t str_refer_to = { "Refer-To", 8 };
 	static const pj_str_t str_replaces = { "Replaces", 8 };
+
+	if (!session->channel) {
+		/* No channel to refer.  Likely because the call was just hung up. */
+		pjsip_dlg_respond(session->inv_session->dlg, rdata, 404, NULL, NULL, NULL);
+		ast_debug(3, "Received a REFER on a session with no channel from endpoint '%s'.\n",
+			ast_sorcery_object_get_id(session->endpoint));
+		return 0;
+	}
 
 	if (!session->endpoint->allowtransfer) {
 		pjsip_dlg_respond(session->inv_session->dlg, rdata, 603, NULL, NULL, NULL);
@@ -982,10 +1087,41 @@ static int refer_incoming_request(struct ast_sip_session *session, pjsip_rx_data
 	}
 }
 
+/*!
+ * \brief Use the value of a channel variable as the value of a SIP header
+ *
+ * This looks up a variable name on a channel, then takes that value and adds
+ * it to an outgoing SIP request. If the header already exists on the message,
+ * then no action is taken.
+ *
+ * \pre chan is locked.
+ *
+ * \param chan The channel on which to find the variable.
+ * \param var_name The name of the channel variable to use.
+ * \param header_name The name of the SIP header to add to the outgoing message.
+ * \param tdata The outgoing SIP message on which to add the header
+ */
+static void add_header_from_channel_var(struct ast_channel *chan, const char *var_name, const char *header_name, pjsip_tx_data *tdata)
+{
+	const char *var_value;
+	pj_str_t pj_header_name;
+	pjsip_hdr *header;
+
+	var_value = pbx_builtin_getvar_helper(chan, var_name);
+	if (ast_strlen_zero(var_value)) {
+		return;
+	}
+
+	pj_cstr(&pj_header_name, header_name);
+	header = pjsip_msg_find_hdr_by_name(tdata->msg, &pj_header_name, NULL);
+	if (header) {
+		return;
+	}
+	ast_sip_add_header(tdata, header_name, var_value);
+}
+
 static void refer_outgoing_request(struct ast_sip_session *session, struct pjsip_tx_data *tdata)
 {
-	const char *hdr;
-
 	if (pjsip_method_cmp(&tdata->msg->line.req.method, &pjsip_invite_method)
 		|| !session->channel
 		|| session->inv_session->state != PJSIP_INV_STATE_NULL) {
@@ -993,15 +1129,8 @@ static void refer_outgoing_request(struct ast_sip_session *session, struct pjsip
 	}
 
 	ast_channel_lock(session->channel);
-	hdr = pbx_builtin_getvar_helper(session->channel, "SIPREPLACESHDR");
-	if (!ast_strlen_zero(hdr)) {
-		ast_sip_add_header(tdata, "Replaces", hdr);
-	}
-
-	hdr = pbx_builtin_getvar_helper(session->channel, "SIPREFERREDBYHDR");
-	if (!ast_strlen_zero(hdr)) {
-		ast_sip_add_header(tdata, "Referred-By", hdr);
-	}
+	add_header_from_channel_var(session->channel, "SIPREPLACESHDR", "Replaces", tdata);
+	add_header_from_channel_var(session->channel, "SIPREFERREDBYHDR", "Referred-By", tdata);
 	ast_channel_unlock(session->channel);
 }
 

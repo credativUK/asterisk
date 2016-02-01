@@ -30,7 +30,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 425384 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <regex.h>
 
@@ -142,6 +142,8 @@ static struct ast_variable *sorcery_realtime_filter_objectset(struct ast_variabl
 		}
 	}
 
+	ao2_cleanup(object_type);
+
 	return objectset;
 }
 
@@ -158,7 +160,9 @@ static void *sorcery_realtime_retrieve_fields(const struct ast_sorcery *sorcery,
 
 	objectset = sorcery_realtime_filter_objectset(objectset, &id, sorcery, type);
 
-	if (!id || !(object = ast_sorcery_alloc(sorcery, type, id->value)) || ast_sorcery_objectset_apply(sorcery, object, objectset)) {
+	if (!id
+		|| !(object = ast_sorcery_alloc(sorcery, type, id->value))
+		|| ast_sorcery_objectset_apply(sorcery, object, objectset)) {
 		return NULL;
 	}
 
@@ -214,16 +218,12 @@ static void sorcery_realtime_retrieve_multiple(const struct ast_sorcery *sorcery
 
 static void sorcery_realtime_retrieve_regex(const struct ast_sorcery *sorcery, void *data, const char *type, struct ao2_container *objects, const char *regex)
 {
-	char field[strlen(UUID_FIELD) + 6], value[strlen(regex) + 2];
+	char field[strlen(UUID_FIELD) + 6], value[strlen(regex) + 3];
 	RAII_VAR(struct ast_variable *, fields, NULL, ast_variables_destroy);
 
 	/* The realtime API provides no direct ability to do regex so for now we support a limited subset using pattern matching */
-	if (regex[0] != '^') {
-		return;
-	}
-
 	snprintf(field, sizeof(field), "%s LIKE", UUID_FIELD);
-	snprintf(value, sizeof(value), "%s%%", regex + 1);
+	snprintf(value, sizeof(value), "%%%s%%", regex);
 
 	if (!(fields = ast_variable_new(field, value, ""))) {
 		return;

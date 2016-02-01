@@ -29,7 +29,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 428687 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/astobj2.h"
 #include "asterisk/endpoints.h"
@@ -415,6 +415,14 @@ const char *ast_endpoint_get_id(const struct ast_endpoint *endpoint)
 	return endpoint->id;
 }
 
+enum ast_endpoint_state ast_endpoint_get_state(const struct ast_endpoint *endpoint)
+{
+	if (!endpoint) {
+		return AST_ENDPOINT_UNKNOWN;
+	}
+	return endpoint->state;
+}
+
 void ast_endpoint_set_state(struct ast_endpoint *endpoint,
 	enum ast_endpoint_state state)
 {
@@ -456,7 +464,7 @@ static void endpoint_snapshot_dtor(void *obj)
 struct ast_endpoint_snapshot *ast_endpoint_snapshot_create(
 	struct ast_endpoint *endpoint)
 {
-	RAII_VAR(struct ast_endpoint_snapshot *, snapshot, NULL, ao2_cleanup);
+	struct ast_endpoint_snapshot *snapshot;
 	int channel_count;
 	struct ao2_iterator i;
 	void *obj;
@@ -467,11 +475,13 @@ struct ast_endpoint_snapshot *ast_endpoint_snapshot_create(
 
 	channel_count = ao2_container_count(endpoint->channel_ids);
 
-	snapshot = ao2_alloc(
+	snapshot = ao2_alloc_options(
 		sizeof(*snapshot) + channel_count * sizeof(char *),
-		endpoint_snapshot_dtor);
+		endpoint_snapshot_dtor,
+		AO2_ALLOC_OPT_LOCK_NOLOCK);
 
-	if (ast_string_field_init(snapshot, 80) != 0) {
+	if (!snapshot || ast_string_field_init(snapshot, 80) != 0) {
+		ao2_cleanup(snapshot);
 		return NULL;
 	}
 
@@ -490,7 +500,6 @@ struct ast_endpoint_snapshot *ast_endpoint_snapshot_create(
 	}
 	ao2_iterator_destroy(&i);
 
-	ao2_ref(snapshot, +1);
 	return snapshot;
 }
 

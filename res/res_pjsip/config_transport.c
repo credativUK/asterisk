@@ -27,6 +27,7 @@
 #include "asterisk/astobj2.h"
 #include "asterisk/sorcery.h"
 #include "asterisk/acl.h"
+#include "asterisk/utils.h"
 #include "include/res_pjsip_private.h"
 #include "asterisk/http_websocket.h"
 
@@ -216,8 +217,49 @@ static int transport_apply(const struct ast_sorcery *sorcery, void *obj)
 
 		res = pjsip_tcp_transport_start3(ast_sip_get_pjsip_endpoint(), &cfg, &transport->state->factory);
 	} else if (transport->type == AST_TRANSPORT_TLS) {
+		if (transport->async_operations > 1 && ast_compare_versions(pj_get_version(), "2.5.0") < 0) {
+			ast_log(LOG_ERROR, "Transport: %s: When protocol=tls and pjproject version < 2.5.0, async_operations can't be > 1\n",
+					ast_sorcery_object_get_id(obj));
+			return -1;
+		}
+		if (!ast_strlen_zero(transport->ca_list_file)) {
+			if (!ast_file_is_readable(transport->ca_list_file)) {
+				ast_log(LOG_ERROR, "Transport: %s: ca_list_file %s is either missing or not readable\n",
+						ast_sorcery_object_get_id(obj), transport->ca_list_file);
+				return -1;
+			}
+		}
 		transport->tls.ca_list_file = pj_str((char*)transport->ca_list_file);
+#ifdef HAVE_PJ_SSL_CERT_LOAD_FROM_FILES2
+		if (!ast_strlen_zero(transport->ca_list_path)) {
+			if (!ast_file_is_readable(transport->ca_list_path)) {
+				ast_log(LOG_ERROR, "Transport: %s: ca_list_path %s is either missing or not readable\n",
+						ast_sorcery_object_get_id(obj), transport->ca_list_path);
+				return -1;
+			}
+		}
+		transport->tls.ca_list_path = pj_str((char*)transport->ca_list_path);
+#else
+		if (!ast_strlen_zero(transport->ca_list_path)) {
+			ast_log(LOG_WARNING, "Asterisk has been built against a version of pjproject that does not "
+					"support the 'ca_list_path' option. Please upgrade to version 2.4 or later.\n");
+		}
+#endif
+		if (!ast_strlen_zero(transport->cert_file)) {
+			if (!ast_file_is_readable(transport->cert_file)) {
+				ast_log(LOG_ERROR, "Transport: %s: cert_file %s is either missing or not readable\n",
+						ast_sorcery_object_get_id(obj), transport->cert_file);
+				return -1;
+			}
+		}
 		transport->tls.cert_file = pj_str((char*)transport->cert_file);
+		if (!ast_strlen_zero(transport->privkey_file)) {
+			if (!ast_file_is_readable(transport->privkey_file)) {
+				ast_log(LOG_ERROR, "Transport: %s: privkey_file %s is either missing or not readable\n",
+						ast_sorcery_object_get_id(obj), transport->privkey_file);
+				return -1;
+			}
+		}
 		transport->tls.privkey_file = pj_str((char*)transport->privkey_file);
 		transport->tls.password = pj_str((char*)transport->password);
 		set_qos(transport, &transport->tls.qos_params);
@@ -369,7 +411,6 @@ static int transport_tls_method_handler(const struct aco_option *opt, struct ast
 }
 
 static const char *tls_method_map[] = {
-	[PJSIP_SSL_DEFAULT_METHOD] = "default",
 	[PJSIP_SSL_UNSPECIFIED_METHOD] = "unspecified",
 	[PJSIP_TLSV1_METHOD] = "tlsv1",
 	[PJSIP_SSLV2_METHOD] = "sslv2",
@@ -626,13 +667,13 @@ static int tos_to_str(const void *obj, const intptr_t *args, char **buf)
 	return 0;
 }
 
-static struct ao2_container *cli_get_container(void)
+static struct ao2_container *cli_get_container(const char *regex)
 {
 	RAII_VAR(struct ao2_container *, container, NULL, ao2_cleanup);
 	struct ao2_container *s_container;
 
-	container = ast_sorcery_retrieve_by_fields(ast_sip_get_sorcery(), "transport",
-		AST_RETRIEVE_FLAG_MULTIPLE | AST_RETRIEVE_FLAG_ALL, NULL);
+	container = ast_sorcery_retrieve_by_regex(ast_sip_get_sorcery(), "transport",
+		regex);
 	if (!container) {
 		return NULL;
 	}
@@ -713,12 +754,14 @@ static struct ast_cli_entry cli_commands[] = {
 	AST_CLI_DEFINE(handle_pjsip_list_ciphers, "List available OpenSSL cipher names"),
 	AST_CLI_DEFINE(ast_sip_cli_traverse_objects, "List PJSIP Transports",
 		.command = "pjsip list transports",
-		.usage = "Usage: pjsip list transports\n"
-				 "       List the configured PJSIP Transports\n"),
+		.usage = "Usage: pjsip list transports [ like <pattern> ]\n"
+				"       List the configured PJSIP Transports\n"
+				"       Optional regular expression pattern is used to filter the list.\n"),
 	AST_CLI_DEFINE(ast_sip_cli_traverse_objects, "Show PJSIP Transports",
 		.command = "pjsip show transports",
-		.usage = "Usage: pjsip show transports\n"
-				 "       Show the configured PJSIP Transport\n"),
+		.usage = "Usage: pjsip show transports [ like <pattern> ]\n"
+				"       Show the configured PJSIP Transport\n"
+				"       Optional regular expression pattern is used to filter the list.\n"),
 	AST_CLI_DEFINE(ast_sip_cli_traverse_objects, "Show PJSIP Transport",
 		.command = "pjsip show transport",
 		.usage = "Usage: pjsip show transport <id>\n"
@@ -743,6 +786,7 @@ int ast_sip_initialize_sorcery_transport(void)
 	ast_sorcery_object_field_register_custom(sorcery, "transport", "bind", "", transport_bind_handler, transport_bind_to_str, NULL, 0, 0);
 	ast_sorcery_object_field_register(sorcery, "transport", "async_operations", "1", OPT_UINT_T, 0, FLDSET(struct ast_sip_transport, async_operations));
 	ast_sorcery_object_field_register(sorcery, "transport", "ca_list_file", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct ast_sip_transport, ca_list_file));
+	ast_sorcery_object_field_register(sorcery, "transport", "ca_list_path", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct ast_sip_transport, ca_list_path));
 	ast_sorcery_object_field_register(sorcery, "transport", "cert_file", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct ast_sip_transport, cert_file));
 	ast_sorcery_object_field_register(sorcery, "transport", "priv_key_file", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct ast_sip_transport, privkey_file));
 	ast_sorcery_object_field_register(sorcery, "transport", "password", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct ast_sip_transport, password));
@@ -760,7 +804,7 @@ int ast_sip_initialize_sorcery_transport(void)
 	ast_sorcery_object_field_register(sorcery, "transport", "cos", "0", OPT_UINT_T, 0, FLDSET(struct ast_sip_transport, cos));
 	ast_sorcery_object_field_register(sorcery, "transport", "websocket_write_timeout", AST_DEFAULT_WEBSOCKET_WRITE_TIMEOUT_STR, OPT_INT_T, PARSE_IN_RANGE, FLDSET(struct ast_sip_transport, write_timeout), 1, INT_MAX);
 
-	ast_sip_register_endpoint_formatter(&endpoint_transport_formatter);
+	internal_sip_register_endpoint_formatter(&endpoint_transport_formatter);
 
 	cli_formatter = ao2_alloc(sizeof(struct ast_sip_cli_formatter_entry), NULL);
 	if (!cli_formatter) {
@@ -785,6 +829,8 @@ int ast_sip_destroy_sorcery_transport(void)
 {
 	ast_cli_unregister_multiple(cli_commands, ARRAY_LEN(cli_commands));
 	ast_sip_unregister_cli_formatter(cli_formatter);
+
+	internal_sip_unregister_endpoint_formatter(&endpoint_transport_formatter);
 
 	return 0;
 }

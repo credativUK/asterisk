@@ -41,7 +41,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419592 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <netinet/in.h>
 #include <ctype.h>
@@ -1456,7 +1456,7 @@ static void dump_message(char *type, char *vname, unsigned char *buf, int buflen
 	int x;
 	printf("%s %s: [ ", type, vname);
 	for (x = 0; x < buflen; x++)
-		printf("%02x ", buf[x]);
+		printf("%02hhx ", buf[x]);
 	printf("]\n");
 }
 #endif

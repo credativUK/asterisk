@@ -21,6 +21,8 @@
 #include <pjsip.h>
 /* Needed for SUBSCRIBE, NOTIFY, and PUBLISH method definitions */
 #include <pjsip_simple.h>
+#include <pjsip/sip_transaction.h>
+#include <pj/timer.h>
 #include <pjlib.h>
 
 #include "asterisk/res_pjsip.h"
@@ -35,10 +37,17 @@
 #include "asterisk/taskprocessor.h"
 #include "asterisk/uuid.h"
 #include "asterisk/sorcery.h"
+#include "asterisk/file.h"
+#include "asterisk/cli.h"
+#include "asterisk/res_pjsip_cli.h"
+#include "asterisk/test.h"
+#include "asterisk/res_pjsip_presence_xml.h"
 
 /*** MODULEINFO
 	<depend>pjproject</depend>
 	<depend>res_sorcery_config</depend>
+	<depend>res_sorcery_memory</depend>
+	<depend>res_sorcery_astdb</depend>
 	<support_level>core</support_level>
  ***/
 
@@ -195,7 +204,7 @@
 						<para>This setting allows to choose the DTMF mode for endpoint communication.</para>
 						<enumlist>
 							<enum name="rfc4733">
-								<para>DTMF is sent out of band of the main audio stream.This
+								<para>DTMF is sent out of band of the main audio stream.  This
 								supercedes the older <emphasis>RFC-2833</emphasis> used within
 								the older <literal>chan_sip</literal>.</para>
 							</enum>
@@ -205,6 +214,10 @@
 							<enum name="info">
 								<para>DTMF is sent as SIP INFO packets.</para>
 							</enum>
+                                                        <enum name="auto">
+                                                                <para>DTMF is sent as RFC 4733 if the other side supports it or as INBAND if not.</para>
+                                                        </enum>
+
 						</enumlist>
 					</description>
 				</configOption>
@@ -291,9 +304,9 @@
 				<configOption name="rewrite_contact">
 					<synopsis>Allow Contact header to be rewritten with the source IP address-port</synopsis>
 					<description><para>
-						On inbound SIP messages from this endpoint, the Contact header will be changed to have the
-						source IP address and port. This option does not affect outbound messages send to this
-						endpoint.
+						On inbound SIP messages from this endpoint, the Contact header or an appropriate Record-Route
+						header will be changed to have the source IP address and port. This option does not affect
+						outbound messages sent to this endpoint.
 					</para></description>
 				</configOption>
 				<configOption name="rtp_ipv6" default="no">
@@ -312,6 +325,27 @@
 				<configOption name="send_rpid" default="no">
 					<synopsis>Send the Remote-Party-ID header</synopsis>
 				</configOption>
+				<configOption name="rpid_immediate" default="no">
+					<synopsis>Immediately send connected line updates on unanswered incoming calls.</synopsis>
+					<description>
+						<para>When enabled, immediately send <emphasis>180 Ringing</emphasis>
+						or <emphasis>183 Progress</emphasis> response messages to the
+						caller if the connected line information is updated before
+						the call is answered.  This can send a <emphasis>180 Ringing</emphasis>
+						response before the call has even reached the far end.  The
+						caller can start hearing ringback before the far end even gets
+						the call.  Many phones tend to grab the first connected line
+						information and refuse to update the display if it changes.  The
+						first information is not likely to be correct if the call
+						goes to an endpoint not under the control of this Asterisk
+						box.</para>
+						<para>When disabled, a connected line update must wait for
+						another reason to send a message with the connected line
+						information to the caller before the call is answered.  You can
+						trigger the sending of the information by using an appropriate
+						dialplan application such as <emphasis>Ringing</emphasis>.</para>
+					</description>
+				</configOption>
 				<configOption name="timers_min_se" default="90">
 					<synopsis>Minimum session timers expiration period</synopsis>
 					<description><para>
@@ -322,10 +356,11 @@
 					<synopsis>Session timers for SIP packets</synopsis>
 					<description>
 						<enumlist>
-							<enum name="forced" />
 							<enum name="no" />
-							<enum name="required" />
 							<enum name="yes" />
+							<enum name="required" />
+							<enum name="always" />
+							<enum name="forced"><para>Alias of always</para></enum>
 						</enumlist>
 					</description>
 				</configOption>
@@ -436,6 +471,15 @@
 					<description><para>
 						This option only applies if <replaceable>media_encryption</replaceable> is
 						set to <literal>sdes</literal> or <literal>dtls</literal>.
+					</para></description>
+				</configOption>
+				<configOption name="g726_non_standard" default="no">
+					<synopsis>Force g.726 to use AAL2 packing order when negotiating g.726 audio</synopsis>
+					<description><para>
+                                                When set to "yes" and an endpoint negotiates g.726 audio then use g.726 for AAL2
+                                                packing order instead of what is recommended by RFC3551. Since this essentially
+                                                replaces the underlying 'g726' codec with 'g726aal2' then 'g726aal2' needs to be
+                                                specified in the endpoint's allowed codec list.
 					</para></description>
 				</configOption>
 				<configOption name="inband_progress" default="no">
@@ -579,6 +623,9 @@
 				</configOption>
 				<configOption name="allow_transfer" default="yes">
 					<synopsis>Determines whether SIP REFER transfers are allowed for this endpoint</synopsis>
+				</configOption>
+				<configOption name="user_eq_phone" default="no">
+					<synopsis>Determines whether a user=phone parameter is placed into the request URI if the user is determined to be a phone number</synopsis>
 				</configOption>
 				<configOption name="sdp_owner" default="-">
 					<synopsis>String placed as the username portion of an SDP origin (o=) line.</synopsis>
@@ -742,6 +789,30 @@
 						have this accountcode set on it.
 					</para></description>
 				</configOption>
+				<configOption name="rtp_keepalive">
+					<synopsis>Number of seconds between RTP comfort noise keepalive packets.</synopsis>
+					<description><para>
+						At the specified interval, Asterisk will send an RTP comfort noise frame. This may
+						be useful for situations where Asterisk is behind a NAT or firewall and must keep a
+						hole open in order to allow for media to arrive at Asterisk.
+					</para></description>
+				</configOption>
+				<configOption name="rtp_timeout" default="0">
+					<synopsis>Maximum number of seconds without receiving RTP (while off hold) before terminating call.</synopsis>
+					<description><para>
+						This option configures the number of seconds without RTP (while off hold) before
+						considering a channel as dead. When the number of seconds is reached the underlying
+						channel is hung up. By default this option is set to 0, which means do not check.
+					</para></description>
+				</configOption>
+				<configOption name="rtp_timeout_hold" default="0">
+					<synopsis>Maximum number of seconds without receiving RTP (while on hold) before terminating call.</synopsis>
+					<description><para>
+						This option configures the number of seconds without RTP (while on hold) before
+						considering a channel as dead. When the number of seconds is reached the underlying
+						channel is hung up. By default this option is set to 0, which means do not check.
+					</para></description>
+				</configOption>
 			</configObject>
 			<configObject name="auth">
 				<synopsis>Authentication type</synopsis>
@@ -823,6 +894,9 @@
 				<configOption name="ca_list_file">
 					<synopsis>File containing a list of certificates to read (TLS ONLY)</synopsis>
 				</configOption>
+				<configOption name="ca_list_path">
+					<synopsis>Path to directory containing a list of certificates to read (TLS ONLY)</synopsis>
+				</configOption>
 				<configOption name="cert_file">
 					<synopsis>Certificate file for endpoint (TLS ONLY)</synopsis>
 					<description><para>
@@ -868,8 +942,12 @@
 					<synopsis>Method of SSL transport (TLS ONLY)</synopsis>
 					<description>
 						<enumlist>
-							<enum name="default" />
-							<enum name="unspecified" />
+							<enum name="default">
+								<para>The default as defined by PJSIP. This is currently TLSv1, but may change with future releases.</para>
+							</enum>
+							<enum name="unspecified">
+								<para>This option is equivalent to setting 'default'</para>
+							</enum>
 							<enum name="tlsv1" />
 							<enum name="sslv2" />
 							<enum name="sslv3" />
@@ -963,6 +1041,14 @@
 					<description><para>
 						Interval between attempts to qualify the contact for reachability.
 						If <literal>0</literal> never qualify. Time in seconds.
+					</para></description>
+				</configOption>
+				<configOption name="qualify_timeout" default="3.0">
+					<synopsis>Timeout for qualify</synopsis>
+					<description><para>
+						If the contact doesn't repond to the OPTIONS request before the timeout,
+						the contact is marked unavailable.
+						If <literal>0</literal> no timeout. Time in fractional seconds.
 					</para></description>
 				</configOption>
 				<configOption name="outbound_proxy">
@@ -1079,6 +1165,14 @@
 						If <literal>0</literal> never qualify. Time in seconds.
 					</para></description>
 				</configOption>
+				<configOption name="qualify_timeout" default="3.0">
+					<synopsis>Timeout for qualify</synopsis>
+					<description><para>
+						If the contact doesn't repond to the OPTIONS request before the timeout,
+						the contact is marked unavailable.
+						If <literal>0</literal> no timeout. Time in fractional seconds.
+					</para></description>
+				</configOption>
 				<configOption name="authenticate_qualify" default="no">
 					<synopsis>Authenticates a qualify request if needed</synopsis>
 					<description><para>
@@ -1164,6 +1258,13 @@
 				<configOption name="max_forwards" default="70">
 					<synopsis>Value used in Max-Forwards header for SIP requests.</synopsis>
 				</configOption>
+				<configOption name="keep_alive_interval" default="0">
+					<synopsis>The interval (in seconds) to send keepalives to active connection-oriented transports.</synopsis>
+				</configOption>
+				<configOption name="max_initial_qualify_time" default="0">
+					<synopsis>The maximum amount of time from startup that qualifies should be attempted on all contacts.
+					If greater than the qualify_frequency for an aor, qualify_frequency will be used instead.</synopsis>
+				</configOption>
 				<configOption name="type">
 					<synopsis>Must be of type 'global'.</synopsis>
 				</configOption>
@@ -1176,6 +1277,16 @@
 				<configOption name="debug" default="no">
 					<synopsis>Enable/Disable SIP debug logging.  Valid options include yes|no or
                                         a host address</synopsis>
+				</configOption>
+				<configOption name="endpoint_identifier_order" default="ip,username,anonymous">
+					<synopsis>The order by which endpoint identifiers are processed and checked.
+                                        Identifier names are usually derived from and can be found in the endpoint
+                                        identifier module itself (res_pjsip_endpoint_identifier_*)</synopsis>
+				</configOption>
+				<configOption name="default_from_user" default="asterisk">
+					<synopsis>When Asterisk generates an outgoing SIP request, the From header username will be
+                                        set to this value if there is no better option (such as CallerID) to be
+                                        used.</synopsis>
 				</configOption>
 			</configObject>
 		</configFile>
@@ -1323,6 +1434,9 @@
 				</parameter>
 				<parameter name="CaListFile">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='transport']/configOption[@name='ca_list_file']/synopsis/node())"/></para>
+				</parameter>
+				<parameter name="CaListPath">
+					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='transport']/configOption[@name='ca_list_path']/synopsis/node())"/></para>
 				</parameter>
 				<parameter name="CertFile">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='transport']/configOption[@name='cert_file']/synopsis/node())"/></para>
@@ -1568,6 +1682,9 @@
 				<parameter name="AllowTransfer">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='allow_transfer']/synopsis/node())"/></para>
 				</parameter>
+				<parameter name="UserEqPhone">
+					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='user_eq_phone']/synopsis/node())"/></para>
+				</parameter>
 				<parameter name="SdpOwner">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='sdp_owner']/synopsis/node())"/></para>
 				</parameter>
@@ -1781,11 +1898,32 @@
 
 #define MOD_DATA_CONTACT "contact"
 
+/*! Number of serializers in pool if one not supplied. */
+#define SERIALIZER_POOL_SIZE		8
+
+/*! Next serializer pool index to use. */
+static int serializer_pool_pos;
+
+/*! Pool of serializers to use if not supplied. */
+static struct ast_taskprocessor *serializer_pool[SERIALIZER_POOL_SIZE];
+
 static pjsip_endpoint *ast_pjsip_endpoint;
 
 static struct ast_threadpool *sip_threadpool;
 
-static int register_service(void *data)
+/*! Local host address for IPv4 */
+static pj_sockaddr host_ip_ipv4;
+
+/*! Local host address for IPv4 (string form) */
+static char host_ip_ipv4_string[PJ_INET6_ADDRSTRLEN + 2];
+
+/*! Local host address for IPv6 */
+static pj_sockaddr host_ip_ipv6;
+
+/*! Local host address for IPv6 (string form) */
+static char host_ip_ipv6_string[PJ_INET6_ADDRSTRLEN + 2];
+
+static int register_service_noref(void *data)
 {
 	pjsip_module **module = data;
 	if (!ast_pjsip_endpoint) {
@@ -1797,8 +1935,23 @@ static int register_service(void *data)
 		return -1;
 	}
 	ast_debug(1, "Registered SIP service %.*s (%p)\n", (int) pj_strlen(&(*module)->name), pj_strbuf(&(*module)->name), *module);
-	ast_module_ref(ast_module_info->self);
 	return 0;
+}
+
+static int register_service(void *data)
+{
+	int res;
+
+	if (!(res = register_service_noref(data))) {
+		ast_module_ref(ast_module_info->self);
+	}
+
+	return res;
+}
+
+int internal_sip_register_service(pjsip_module *module)
+{
+	return ast_sip_push_task_synchronous(NULL, register_service_noref, &module);
 }
 
 int ast_sip_register_service(pjsip_module *module)
@@ -1806,16 +1959,31 @@ int ast_sip_register_service(pjsip_module *module)
 	return ast_sip_push_task_synchronous(NULL, register_service, &module);
 }
 
-static int unregister_service(void *data)
+static int unregister_service_noref(void *data)
 {
 	pjsip_module **module = data;
-	ast_module_unref(ast_module_info->self);
 	if (!ast_pjsip_endpoint) {
 		return -1;
 	}
 	pjsip_endpt_unregister_module(ast_pjsip_endpoint, *module);
 	ast_debug(1, "Unregistered SIP service %.*s\n", (int) pj_strlen(&(*module)->name), pj_strbuf(&(*module)->name));
 	return 0;
+}
+
+static int unregister_service(void *data)
+{
+	int res;
+
+	if (!(res = unregister_service_noref(data))) {
+		ast_module_unref(ast_module_info->self);
+	}
+
+	return res;
+}
+
+int internal_sip_unregister_service(pjsip_module *module)
+{
+	return ast_sip_push_task_synchronous(NULL, unregister_service_noref, &module);
 }
 
 void ast_sip_unregister_service(pjsip_module *module)
@@ -1905,16 +2073,30 @@ int ast_sip_create_request_with_auth(const struct ast_sip_auth_vector *auths, pj
 	return registered_outbound_authenticator->create_request_with_auth(auths, challenge, tsx, new_request);
 }
 
+int ast_sip_create_request_with_auth_from_old(const struct ast_sip_auth_vector *auths, pjsip_rx_data *challenge,
+		pjsip_tx_data *old_request, pjsip_tx_data **new_request)
+{
+	if (!registered_outbound_authenticator) {
+		ast_log(LOG_WARNING, "No SIP outbound authenticator registered. Cannot respond to authentication challenge\n");
+		return -1;
+	}
+	return registered_outbound_authenticator->create_request_with_auth_from_old(auths, challenge, old_request, new_request);
+}
+
 struct endpoint_identifier_list {
+	const char *name;
+	unsigned int priority;
 	struct ast_sip_endpoint_identifier *identifier;
 	AST_RWLIST_ENTRY(endpoint_identifier_list) list;
 };
 
 static AST_RWLIST_HEAD_STATIC(endpoint_identifiers, endpoint_identifier_list);
 
-int ast_sip_register_endpoint_identifier(struct ast_sip_endpoint_identifier *identifier)
+int ast_sip_register_endpoint_identifier_with_name(struct ast_sip_endpoint_identifier *identifier,
+						 const char *name)
 {
-	struct endpoint_identifier_list *id_list_item;
+	char *prev, *current, *identifier_order;
+	struct endpoint_identifier_list *iter, *id_list_item;
 	SCOPED_LOCK(lock, &endpoint_identifiers, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
 
 	id_list_item = ast_calloc(1, sizeof(*id_list_item));
@@ -1923,12 +2105,76 @@ int ast_sip_register_endpoint_identifier(struct ast_sip_endpoint_identifier *ide
 		return -1;
 	}
 	id_list_item->identifier = identifier;
+	id_list_item->name = name;
 
-	AST_RWLIST_INSERT_TAIL(&endpoint_identifiers, id_list_item, list);
-	ast_debug(1, "Registered endpoint identifier %p\n", identifier);
+	ast_debug(1, "Register endpoint identifier %s (%p)\n", name, identifier);
+
+	if (ast_strlen_zero(name)) {
+		/* if an identifier has no name then place in front */
+		AST_RWLIST_INSERT_HEAD(&endpoint_identifiers, id_list_item, list);
+		ast_module_ref(ast_module_info->self);
+		return 0;
+	}
+
+	/* see if the name of the identifier is in the global endpoint_identifier_order list */
+	identifier_order = prev = current = ast_sip_get_endpoint_identifier_order();
+
+	if (ast_strlen_zero(identifier_order)) {
+		id_list_item->priority = UINT_MAX;
+		AST_RWLIST_INSERT_TAIL(&endpoint_identifiers, id_list_item, list);
+		ast_module_ref(ast_module_info->self);
+		ast_free(identifier_order);
+		return 0;
+	}
+
+	id_list_item->priority = 0;
+	while ((current = strchr(current, ','))) {
+		++id_list_item->priority;
+		if (!strncmp(prev, name, current - prev)) {
+			break;
+		}
+		prev = ++current;
+	}
+
+	if (!current) {
+		/* check to see if it is the only or last item */
+		if (!strcmp(prev, name)) {
+			++id_list_item->priority;
+		} else {
+			id_list_item->priority = UINT_MAX;
+		}
+	}
+
+	if (id_list_item->priority == UINT_MAX || AST_RWLIST_EMPTY(&endpoint_identifiers)) {
+		/* if not in the endpoint_identifier_order list then consider it less in
+		   priority and add it to the end */
+		AST_RWLIST_INSERT_TAIL(&endpoint_identifiers, id_list_item, list);
+		ast_module_ref(ast_module_info->self);
+		ast_free(identifier_order);
+		return 0;
+	}
+
+	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&endpoint_identifiers, iter, list) {
+		if (id_list_item->priority < iter->priority) {
+			AST_RWLIST_INSERT_BEFORE_CURRENT(id_list_item, list);
+			break;
+		}
+
+		if (!AST_RWLIST_NEXT(iter, list)) {
+			AST_RWLIST_INSERT_AFTER(&endpoint_identifiers, iter, id_list_item, list);
+			break;
+		}
+	}
+	AST_RWLIST_TRAVERSE_SAFE_END;
 
 	ast_module_ref(ast_module_info->self);
+	ast_free(identifier_order);
 	return 0;
+}
+
+int ast_sip_register_endpoint_identifier(struct ast_sip_endpoint_identifier *identifier)
+{
+	return ast_sip_register_endpoint_identifier_with_name(identifier, NULL);
 }
 
 void ast_sip_unregister_endpoint_identifier(struct ast_sip_endpoint_identifier *identifier)
@@ -1962,28 +2208,107 @@ struct ast_sip_endpoint *ast_sip_identify_endpoint(pjsip_rx_data *rdata)
 	return endpoint;
 }
 
+static char *cli_show_endpoint_identifiers(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+#define ENDPOINT_IDENTIFIER_FORMAT "%-20.20s\n"
+	struct endpoint_identifier_list *iter;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjsip show identifiers";
+		e->usage = "Usage: pjsip show identifiers\n"
+		            "      List all registered endpoint identifiers\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != 3) {
+                return CLI_SHOWUSAGE;
+        }
+
+	ast_cli(a->fd, ENDPOINT_IDENTIFIER_FORMAT, "Identifier Names:");
+	{
+		SCOPED_LOCK(lock, &endpoint_identifiers, AST_RWLIST_RDLOCK, AST_RWLIST_UNLOCK);
+		AST_RWLIST_TRAVERSE(&endpoint_identifiers, iter, list) {
+			ast_cli(a->fd, ENDPOINT_IDENTIFIER_FORMAT,
+				iter->name ? iter->name : "name not specified");
+		}
+	}
+	return CLI_SUCCESS;
+#undef ENDPOINT_IDENTIFIER_FORMAT
+}
+
+static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct ast_sip_cli_context context;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pjsip show settings";
+		e->usage = "Usage: pjsip show settings\n"
+		            "      Show global and system configuration options\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	context.output_buffer = ast_str_create(256);
+	if (!context.output_buffer) {
+		ast_cli(a->fd, "Could not allocate output buffer.\n");
+		return CLI_FAILURE;
+	}
+
+	if (sip_cli_print_global(&context) || sip_cli_print_system(&context)) {
+		ast_free(context.output_buffer);
+		ast_cli(a->fd, "Error retrieving settings.\n");
+		return CLI_FAILURE;
+	}
+
+	ast_cli(a->fd, "%s", ast_str_buffer(context.output_buffer));
+	ast_free(context.output_buffer);
+	return CLI_SUCCESS;
+}
+
+static struct ast_cli_entry cli_commands[] = {
+        AST_CLI_DEFINE(cli_show_settings, "Show global and system configuration options"),
+        AST_CLI_DEFINE(cli_show_endpoint_identifiers, "List registered endpoint identifiers")
+};
+
 AST_RWLIST_HEAD_STATIC(endpoint_formatters, ast_sip_endpoint_formatter);
 
-int ast_sip_register_endpoint_formatter(struct ast_sip_endpoint_formatter *obj)
+void internal_sip_register_endpoint_formatter(struct ast_sip_endpoint_formatter *obj)
 {
 	SCOPED_LOCK(lock, &endpoint_formatters, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
 	AST_RWLIST_INSERT_TAIL(&endpoint_formatters, obj, next);
+}
+
+int ast_sip_register_endpoint_formatter(struct ast_sip_endpoint_formatter *obj)
+{
+	internal_sip_register_endpoint_formatter(obj);
 	ast_module_ref(ast_module_info->self);
 	return 0;
 }
 
-void ast_sip_unregister_endpoint_formatter(struct ast_sip_endpoint_formatter *obj)
+int internal_sip_unregister_endpoint_formatter(struct ast_sip_endpoint_formatter *obj)
 {
 	struct ast_sip_endpoint_formatter *i;
 	SCOPED_LOCK(lock, &endpoint_formatters, AST_RWLIST_WRLOCK, AST_RWLIST_UNLOCK);
 	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&endpoint_formatters, i, next) {
 		if (i == obj) {
 			AST_RWLIST_REMOVE_CURRENT(next);
-			ast_module_unref(ast_module_info->self);
 			break;
 		}
 	}
 	AST_RWLIST_TRAVERSE_SAFE_END;
+	return i == obj ? 0 : -1;
+}
+
+void ast_sip_unregister_endpoint_formatter(struct ast_sip_endpoint_formatter *obj)
+{
+	if (!internal_sip_unregister_endpoint_formatter(obj)) {
+		ast_module_unref(ast_module_info->self);
+	}
 }
 
 int ast_sip_format_endpoint_ami(struct ast_sip_endpoint *endpoint,
@@ -2017,10 +2342,11 @@ static int sip_dialog_create_from(pj_pool_t *pool, pj_str_t *from, const char *u
 	pjsip_sip_uri *sip_uri;
 	pjsip_transport_type_e type = PJSIP_TRANSPORT_UNSPECIFIED;
 	int local_port;
-	char uuid_str[AST_UUID_STR_LEN];
+	char default_user[PJSIP_MAX_URL_SIZE];
 
 	if (ast_strlen_zero(user)) {
-		user = ast_uuid_generate_str(uuid_str, sizeof(uuid_str));
+		ast_sip_get_default_from_user(default_user, sizeof(default_user));
+		user = default_user;
 	}
 
 	/* Parse the provided target URI so we can determine what transport it will end up using */
@@ -2127,10 +2453,50 @@ static int sip_get_tpselector_from_endpoint(const struct ast_sip_endpoint *endpo
 	return 0;
 }
 
+void ast_sip_add_usereqphone(const struct ast_sip_endpoint *endpoint, pj_pool_t *pool, pjsip_uri *uri)
+{
+	pjsip_sip_uri *sip_uri;
+	int i = 0;
+	pjsip_param *param;
+	const pj_str_t STR_USER = { "user", 4 };
+	const pj_str_t STR_PHONE = { "phone", 5 };
+
+	if (!endpoint || !endpoint->usereqphone || (!PJSIP_URI_SCHEME_IS_SIP(uri) && !PJSIP_URI_SCHEME_IS_SIPS(uri))) {
+		return;
+	}
+
+	sip_uri = pjsip_uri_get_uri(uri);
+
+	if (!pj_strlen(&sip_uri->user)) {
+		return;
+	}
+
+	if (pj_strbuf(&sip_uri->user)[0] == '+') {
+		i = 1;
+	}
+
+	/* Test URI user against allowed characters in AST_DIGIT_ANY */
+	for (; i < pj_strlen(&sip_uri->user); i++) {
+		if (!strchr(AST_DIGIT_ANYNUM, pj_strbuf(&sip_uri->user)[i])) {
+			break;
+		}
+	}
+
+	if (i < pj_strlen(&sip_uri->user)) {
+		return;
+	}
+
+	param = PJ_POOL_ALLOC_T(pool, pjsip_param);
+	param->name = STR_USER;
+	param->value = STR_PHONE;
+	pj_list_insert_before(&sip_uri->other_param, param);
+}
+
 pjsip_dialog *ast_sip_create_dialog_uac(const struct ast_sip_endpoint *endpoint, const char *uri, const char *request_user)
 {
 	char enclosed_uri[PJSIP_MAX_URL_SIZE];
 	pj_str_t local_uri = { "sip:temp@temp", 13 }, remote_uri, target_uri;
+	pj_status_t res;
 	pjsip_dialog *dlg = NULL;
 	const char *outbound_proxy = endpoint->outbound_proxy;
 	pjsip_tpselector selector = { .type = PJSIP_TPSELECTOR_NONE, };
@@ -2141,7 +2507,12 @@ pjsip_dialog *ast_sip_create_dialog_uac(const struct ast_sip_endpoint *endpoint,
 
 	pj_cstr(&target_uri, uri);
 
-	if (pjsip_dlg_create_uac(pjsip_ua_instance(), &local_uri, NULL, &remote_uri, &target_uri, &dlg) != PJ_SUCCESS) {
+	res = pjsip_dlg_create_uac(pjsip_ua_instance(), &local_uri, NULL, &remote_uri, &target_uri, &dlg);
+	if (res != PJ_SUCCESS) {
+		if (res == PJSIP_EINVALIDURI) {
+			ast_log(LOG_ERROR, "Could not create dialog to endpoint '%s' as URI '%s' is not valid\n",
+				ast_sorcery_object_get_id(endpoint), uri);
+		}
 		return NULL;
 	}
 
@@ -2174,6 +2545,10 @@ pjsip_dialog *ast_sip_create_dialog_uac(const struct ast_sip_endpoint *endpoint,
 		}
 	}
 
+	/* Add the user=phone parameter if applicable */
+	ast_sip_add_usereqphone(endpoint, dlg->pool, dlg->target);
+	ast_sip_add_usereqphone(endpoint, dlg->pool, dlg->remote.info->uri);
+
 	/* We have to temporarily bump up the sess_count here so the dialog is not prematurely destroyed */
 	dlg->sess_count++;
 
@@ -2188,6 +2563,8 @@ pjsip_dialog *ast_sip_create_dialog_uac(const struct ast_sip_endpoint *endpoint,
 
 		pj_strdup2_with_null(dlg->pool, &tmp, outbound_proxy);
 		if (!(route = pjsip_parse_hdr(dlg->pool, &ROUTE_HNAME, tmp.ptr, tmp.slen, NULL))) {
+			ast_log(LOG_ERROR, "Could not create dialog to endpoint '%s' as outbound proxy URI '%s' is not valid\n",
+				ast_sorcery_object_get_id(endpoint), outbound_proxy);
 			dlg->sess_count--;
 			pjsip_dlg_terminate(dlg);
 			return NULL;
@@ -2202,22 +2579,71 @@ pjsip_dialog *ast_sip_create_dialog_uac(const struct ast_sip_endpoint *endpoint,
 	return dlg;
 }
 
+/*!
+ * \brief Determine if a SIPS Contact header is required.
+ *
+ * This uses the guideline provided in RFC 3261 Section 12.1.1 to
+ * determine if the Contact header must be a sips: URI.
+ *
+ * \param rdata The incoming dialog-starting request
+ * \retval 0 SIPS not required
+ * \retval 1 SIPS required
+ */
+static int uas_use_sips_contact(pjsip_rx_data *rdata)
+{
+	pjsip_rr_hdr *record_route;
+
+	if (PJSIP_URI_SCHEME_IS_SIPS(rdata->msg_info.msg->line.req.uri)) {
+		return 1;
+	}
+
+	record_route = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_RECORD_ROUTE, NULL);
+	if (record_route) {
+		if (PJSIP_URI_SCHEME_IS_SIPS(&record_route->name_addr)) {
+			return 1;
+		}
+	} else {
+		pjsip_contact_hdr *contact;
+
+		contact = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_CONTACT, NULL);
+		ast_assert(contact != NULL);
+		if (PJSIP_URI_SCHEME_IS_SIPS(contact->uri)) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 pjsip_dialog *ast_sip_create_dialog_uas(const struct ast_sip_endpoint *endpoint, pjsip_rx_data *rdata, pj_status_t *status)
 {
 	pjsip_dialog *dlg;
 	pj_str_t contact;
 	pjsip_transport_type_e type = rdata->tp_info.transport->key.type;
+	pjsip_tpselector selector = { .type = PJSIP_TPSELECTOR_NONE, };
+	pjsip_transport *transport;
 
 	ast_assert(status != NULL);
 
+	if (sip_get_tpselector_from_endpoint(endpoint, &selector)) {
+		return NULL;
+	}
+
+	transport = rdata->tp_info.transport;
+	if (selector.type == PJSIP_TPSELECTOR_TRANSPORT) {
+		transport = selector.u.transport;
+	}
+	type = transport->key.type;
+
 	contact.ptr = pj_pool_alloc(rdata->tp_info.pool, PJSIP_MAX_URL_SIZE);
 	contact.slen = pj_ansi_snprintf(contact.ptr, PJSIP_MAX_URL_SIZE,
-			"<sip:%s%.*s%s:%d%s%s>",
+			"<%s:%s%.*s%s:%d%s%s>",
+			uas_use_sips_contact(rdata) ? "sips" : "sip",
 			(type & PJSIP_TRANSPORT_IPV6) ? "[" : "",
-			(int)rdata->tp_info.transport->local_name.host.slen,
-			rdata->tp_info.transport->local_name.host.ptr,
+			(int)transport->local_name.host.slen,
+			transport->local_name.host.ptr,
 			(type & PJSIP_TRANSPORT_IPV6) ? "]" : "",
-			rdata->tp_info.transport->local_name.port,
+			transport->local_name.port,
 			(type != PJSIP_TRANSPORT_UDP && type != PJSIP_TRANSPORT_UDP6) ? ";transport=" : "",
 			(type != PJSIP_TRANSPORT_UDP && type != PJSIP_TRANSPORT_UDP6) ? pjsip_transport_get_type_name(type) : "");
 
@@ -2231,6 +2657,10 @@ pjsip_dialog *ast_sip_create_dialog_uas(const struct ast_sip_endpoint *endpoint,
 		return NULL;
 	}
 
+	dlg->sess_count++;
+	pjsip_dlg_set_transport(dlg, &selector);
+	dlg->sess_count--;
+
 	return dlg;
 }
 
@@ -2238,6 +2668,12 @@ int ast_sip_create_rdata(pjsip_rx_data *rdata, char *packet, const char *src_nam
 	char *transport_type, const char *local_name, int local_port)
 {
 	pj_str_t tmp;
+
+	/*
+	 * Initialize the error list in case there is a parse error
+	 * in the given packet.
+	 */
+	pj_list_init(&rdata->msg_info.parse_err);
 
 	rdata->tp_info.transport = PJ_POOL_ZALLOC_T(rdata->tp_info.pool, pjsip_transport);
 	if (!rdata->tp_info.transport) {
@@ -2249,7 +2685,7 @@ int ast_sip_create_rdata(pjsip_rx_data *rdata, char *packet, const char *src_nam
 	rdata->pkt_info.src_port = src_port;
 
 	pjsip_parse_rdata(packet, strlen(packet), rdata);
-	if (!rdata->msg_info.msg) {
+	if (!rdata->msg_info.msg || !pj_list_empty(&rdata->msg_info.parse_err)) {
 		return -1;
 	}
 
@@ -2322,6 +2758,7 @@ static int create_out_of_dialog_request(const pjsip_method *method, struct ast_s
 	pj_str_t from;
 	pj_pool_t *pool;
 	pjsip_tpselector selector = { .type = PJSIP_TPSELECTOR_NONE, };
+	pjsip_uri *sip_uri;
 
 	if (ast_strlen_zero(uri)) {
 		if (!endpoint && (!contact || ast_strlen_zero(contact->uri))) {
@@ -2358,10 +2795,21 @@ static int create_out_of_dialog_request(const pjsip_method *method, struct ast_s
 		return -1;
 	}
 
+	sip_uri = pjsip_parse_uri(pool, remote_uri.ptr, remote_uri.slen, 0);
+	if (!sip_uri || (!PJSIP_URI_SCHEME_IS_SIP(sip_uri) && !PJSIP_URI_SCHEME_IS_SIPS(sip_uri))) {
+		ast_log(LOG_ERROR, "Unable to create outbound %.*s request to endpoint %s as URI '%s' is not valid\n",
+			(int) pj_strlen(&method->name), pj_strbuf(&method->name),
+			endpoint ? ast_sorcery_object_get_id(endpoint) : "<none>",
+			pj_strbuf(&remote_uri));
+		pjsip_endpt_release_pool(ast_sip_get_pjsip_endpoint(), pool);
+		return -1;
+	}
+
 	if (sip_dialog_create_from(pool, &from, endpoint ? endpoint->fromuser : NULL,
 				endpoint ? endpoint->fromdomain : NULL, &remote_uri, &selector)) {
 		ast_log(LOG_ERROR, "Unable to create From header for %.*s request to endpoint %s\n",
-				(int) pj_strlen(&method->name), pj_strbuf(&method->name), ast_sorcery_object_get_id(endpoint));
+				(int) pj_strlen(&method->name), pj_strbuf(&method->name),
+				endpoint ? ast_sorcery_object_get_id(endpoint) : "<none>");
 		pjsip_endpt_release_pool(ast_sip_get_pjsip_endpoint(), pool);
 		return -1;
 	}
@@ -2369,16 +2817,21 @@ static int create_out_of_dialog_request(const pjsip_method *method, struct ast_s
 	if (pjsip_endpt_create_request(ast_sip_get_pjsip_endpoint(), method, &remote_uri,
 			&from, &remote_uri, &from, NULL, -1, NULL, tdata) != PJ_SUCCESS) {
 		ast_log(LOG_ERROR, "Unable to create outbound %.*s request to endpoint %s\n",
-				(int) pj_strlen(&method->name), pj_strbuf(&method->name), ast_sorcery_object_get_id(endpoint));
+				(int) pj_strlen(&method->name), pj_strbuf(&method->name),
+				endpoint ? ast_sorcery_object_get_id(endpoint) : "<none>");
 		pjsip_endpt_release_pool(ast_sip_get_pjsip_endpoint(), pool);
 		return -1;
 	}
 
+	/* Add the user=phone parameter if applicable */
+	ast_sip_add_usereqphone(endpoint, (*tdata)->pool, (*tdata)->msg->line.req.uri);
+
 	/* If an outbound proxy is specified on the endpoint apply it to this request */
 	if (endpoint && !ast_strlen_zero(endpoint->outbound_proxy) &&
 		ast_sip_set_outbound_proxy((*tdata), endpoint->outbound_proxy)) {
-		ast_log(LOG_ERROR, "Unable to apply outbound proxy on request %.*s to endpoint %s\n",
-			(int) pj_strlen(&method->name), pj_strbuf(&method->name), ast_sorcery_object_get_id(endpoint));
+		ast_log(LOG_ERROR, "Unable to apply outbound proxy on request %.*s to endpoint %s as outbound proxy URI '%s' is not valid\n",
+			(int) pj_strlen(&method->name), pj_strbuf(&method->name), ast_sorcery_object_get_id(endpoint),
+			endpoint->outbound_proxy);
 		pjsip_endpt_release_pool(ast_sip_get_pjsip_endpoint(), pool);
 		return -1;
 	}
@@ -2472,6 +2925,8 @@ static pj_bool_t does_method_match(const pj_str_t *message_method, const char *s
 
 /*! Maximum number of challenges before assuming that we are in a loop */
 #define MAX_RX_CHALLENGES	10
+#define TIMER_INACTIVE		0
+#define TIMEOUT_TIMER2		5
 
 /*! \brief Structure to hold information about an outbound request */
 struct send_request_data {
@@ -2517,17 +2972,126 @@ struct send_request_wrapper {
 	void (*callback)(void *token, pjsip_event *e);
 	/*! Non-zero when the callback is called. */
 	unsigned int cb_called;
+	/*! Timeout timer. */
+	pj_timer_entry *timeout_timer;
+	/*! Original timeout. */
+	pj_int32_t timeout;
+	/*! The transmit data. */
+	pjsip_tx_data *tdata;
 };
 
-static void endpt_send_request_wrapper(void *token, pjsip_event *e)
+/*! \internal This function gets called by pjsip when the transaction ends,
+ * even if it timed out.  The lock prevents a race condition if both the pjsip
+ * transaction timer and our own timer expire simultaneously.
+ */
+static void endpt_send_request_cb(void *token, pjsip_event *e)
 {
 	struct send_request_wrapper *req_wrapper = token;
 
-	req_wrapper->cb_called = 1;
-	if (req_wrapper->callback) {
-		req_wrapper->callback(req_wrapper->token, e);
+	if (e->body.tsx_state.type == PJSIP_EVENT_TIMER) {
+		ast_debug(2, "%p: PJSIP tsx timer expired\n", req_wrapper);
+
+		if (req_wrapper->timeout_timer
+			&& req_wrapper->timeout_timer->id != TIMEOUT_TIMER2) {
+			ast_debug(3, "%p: Timeout already handled\n", req_wrapper);
+			ao2_ref(req_wrapper, -1);
+			return;
+		}
+	} else {
+		ast_debug(2, "%p: PJSIP tsx response received\n", req_wrapper);
 	}
+
+	ao2_lock(req_wrapper);
+
+	/* It's possible that our own timer was already processing while
+	 * we were waiting on the lock so check the timer id.  If it's
+	 * still TIMER2 then we still need to process.
+	 */
+	if (req_wrapper->timeout_timer
+		&& req_wrapper->timeout_timer->id == TIMEOUT_TIMER2) {
+		int timers_cancelled = 0;
+
+		ast_debug(3, "%p: Cancelling timer\n", req_wrapper);
+
+		timers_cancelled = pj_timer_heap_cancel_if_active(
+			pjsip_endpt_get_timer_heap(ast_sip_get_pjsip_endpoint()),
+			req_wrapper->timeout_timer, TIMER_INACTIVE);
+
+		if (timers_cancelled > 0) {
+			/* If the timer was cancelled the callback will never run so
+			 * clean up its reference to the wrapper.
+			 */
+			ast_debug(3, "%p: Timer cancelled\n", req_wrapper);
+			ao2_ref(req_wrapper, -1);
+		} else {
+			/* If it wasn't cancelled, it MAY be in the callback already
+			 * waiting on the lock so set the id to INACTIVE so
+			 * when the callback comes out of the lock, it knows to not
+			 * proceed.
+			 */
+			ast_debug(3, "%p: Timer already expired\n", req_wrapper);
+			req_wrapper->timeout_timer->id = TIMER_INACTIVE;
+		}
+	}
+
+	/* It's possible that our own timer expired and called the callbacks
+	 * so no need to call them again.
+	 */
+	if (!req_wrapper->cb_called && req_wrapper->callback) {
+		req_wrapper->callback(req_wrapper->token, e);
+		req_wrapper->cb_called = 1;
+		ast_debug(2, "%p: Callbacks executed\n", req_wrapper);
+	}
+	ao2_unlock(req_wrapper);
 	ao2_ref(req_wrapper, -1);
+}
+
+/*! \internal This function gets called by our own timer when it expires.
+ * If the timer is cancelled however, the function does NOT get called.
+ * The lock prevents a race condition if both the pjsip transaction timer
+ * and our own timer expire simultaneously.
+ */
+static void send_request_timer_callback(pj_timer_heap_t *theap, pj_timer_entry *entry)
+{
+	pjsip_event event;
+	struct send_request_wrapper *req_wrapper = entry->user_data;
+
+	ast_debug(2, "%p: Internal tsx timer expired after %d msec\n",
+		req_wrapper, req_wrapper->timeout);
+
+	ao2_lock(req_wrapper);
+	/* If the id is not TIMEOUT_TIMER2 then the timer was cancelled above
+	 * while the lock was being held so just clean up.
+	 */
+	if (entry->id != TIMEOUT_TIMER2) {
+		ao2_unlock(req_wrapper);
+		ast_debug(3, "%p: Timeout already handled\n", req_wrapper);
+		ao2_ref(req_wrapper, -1);
+		return;
+	}
+
+	ast_debug(3, "%p: Timer handled here\n", req_wrapper);
+
+	PJSIP_EVENT_INIT_TX_MSG(event, req_wrapper->tdata);
+	event.body.tsx_state.type = PJSIP_EVENT_TIMER;
+	entry->id = TIMER_INACTIVE;
+
+	if (!req_wrapper->cb_called && req_wrapper->callback) {
+		req_wrapper->callback(req_wrapper->token, &event);
+		req_wrapper->cb_called = 1;
+		ast_debug(2, "%p: Callbacks executed\n", req_wrapper);
+	}
+
+	ao2_unlock(req_wrapper);
+	ao2_ref(req_wrapper, -1);
+}
+
+static void send_request_wrapper_destructor(void *obj)
+{
+	struct send_request_wrapper *req_wrapper = obj;
+
+	pjsip_tx_data_dec_ref(req_wrapper->tdata);
+	ast_debug(2, "%p: wrapper destroyed\n", req_wrapper);
 }
 
 static pj_status_t endpt_send_request(struct ast_sip_endpoint *endpoint,
@@ -2535,22 +3099,68 @@ static pj_status_t endpt_send_request(struct ast_sip_endpoint *endpoint,
 {
 	struct send_request_wrapper *req_wrapper;
 	pj_status_t ret_val;
+	pjsip_endpoint *endpt = ast_sip_get_pjsip_endpoint();
 
 	/* Create wrapper to detect if the callback was actually called on an error. */
-	req_wrapper = ao2_alloc_options(sizeof(*req_wrapper), NULL,
-		AO2_ALLOC_OPT_LOCK_NOLOCK);
+	req_wrapper = ao2_alloc(sizeof(*req_wrapper), send_request_wrapper_destructor);
 	if (!req_wrapper) {
 		pjsip_tx_data_dec_ref(tdata);
 		return PJ_ENOMEM;
 	}
+
+	ast_debug(2, "%p: Wrapper created\n", req_wrapper);
+
 	req_wrapper->token = token;
 	req_wrapper->callback = cb;
+	req_wrapper->timeout = timeout;
+	req_wrapper->timeout_timer = NULL;
+	req_wrapper->tdata = tdata;
+	/* Add a reference to tdata.  The wrapper destructor cleans it up. */
+	pjsip_tx_data_add_ref(tdata);
 
+	ao2_lock(req_wrapper);
+
+	if (timeout > 0) {
+		pj_time_val timeout_timer_val = { timeout / 1000, timeout % 1000 };
+
+		req_wrapper->timeout_timer = PJ_POOL_ALLOC_T(tdata->pool, pj_timer_entry);
+
+		ast_debug(2, "%p: Set timer to %d msec\n", req_wrapper, timeout);
+
+		pj_timer_entry_init(req_wrapper->timeout_timer, TIMEOUT_TIMER2,
+			req_wrapper, &send_request_timer_callback);
+
+		pj_timer_heap_cancel_if_active(pjsip_endpt_get_timer_heap(endpt),
+			req_wrapper->timeout_timer, TIMER_INACTIVE);
+
+		/* We need to insure that the wrapper and tdata are available if/when the
+		 * timer callback is executed.
+		 */
+		ao2_ref(req_wrapper, +1);
+		pj_timer_heap_schedule(pjsip_endpt_get_timer_heap(endpt),
+			req_wrapper->timeout_timer, &timeout_timer_val);
+
+		req_wrapper->timeout_timer->id = TIMEOUT_TIMER2;
+	} else {
+		req_wrapper->timeout_timer = NULL;
+	}
+
+	/* We need to insure that the wrapper and tdata are available when the
+	 * transaction callback is executed.
+	 */
 	ao2_ref(req_wrapper, +1);
-	ret_val = pjsip_endpt_send_request(ast_sip_get_pjsip_endpoint(), tdata, timeout,
-		req_wrapper, endpt_send_request_wrapper);
+
+	ret_val = pjsip_endpt_send_request(endpt, tdata, -1, req_wrapper, endpt_send_request_cb);
 	if (ret_val != PJ_SUCCESS) {
 		char errmsg[PJ_ERR_MSG_SIZE];
+
+		if (timeout > 0) {
+			int timers_cancelled = pj_timer_heap_cancel_if_active(pjsip_endpt_get_timer_heap(endpt),
+				req_wrapper->timeout_timer, TIMER_INACTIVE);
+			if (timers_cancelled > 0) {
+				ao2_ref(req_wrapper, -1);
+			}
+		}
 
 		/* Complain of failure to send the request. */
 		pj_strerror(ret_val, errmsg, sizeof(errmsg));
@@ -2572,6 +3182,7 @@ static pj_status_t endpt_send_request(struct ast_sip_endpoint *endpoint,
 			ao2_ref(req_wrapper, -1);
 		}
 	}
+	ao2_unlock(req_wrapper);
 	ao2_ref(req_wrapper, -1);
 	return ret_val;
 }
@@ -2627,7 +3238,7 @@ static void send_request_cb(void *token, pjsip_event *e)
 		}
 		break;
 	default:
-		ast_log(LOG_ERROR, "Unexpected PJSIP event %d\n", e->body.tsx_state.type);
+		ast_log(LOG_ERROR, "Unexpected PJSIP event %u\n", e->body.tsx_state.type);
 		break;
 	}
 
@@ -2637,8 +3248,9 @@ static void send_request_cb(void *token, pjsip_event *e)
 	ao2_ref(req_data, -1);
 }
 
-static int send_out_of_dialog_request(pjsip_tx_data *tdata, struct ast_sip_endpoint *endpoint,
-	void *token, void (*callback)(void *token, pjsip_event *e))
+int ast_sip_send_out_of_dialog_request(pjsip_tx_data *tdata,
+	struct ast_sip_endpoint *endpoint, int timeout, void *token,
+	void (*callback)(void *token, pjsip_event *e))
 {
 	struct ast_sip_supplement *supplement;
 	struct send_request_data *req_data;
@@ -2664,7 +3276,7 @@ static int send_out_of_dialog_request(pjsip_tx_data *tdata, struct ast_sip_endpo
 	ast_sip_mod_data_set(tdata->pool, tdata->mod_data, supplement_module.id, MOD_DATA_CONTACT, NULL);
 	ao2_cleanup(contact);
 
-	if (endpt_send_request(endpoint, tdata, -1, req_data, send_request_cb)
+	if (endpt_send_request(endpoint, tdata, timeout, req_data, send_request_cb)
 		!= PJ_SUCCESS) {
 		ao2_cleanup(req_data);
 		return -1;
@@ -2682,7 +3294,7 @@ int ast_sip_send_request(pjsip_tx_data *tdata, struct pjsip_dialog *dlg,
 	if (dlg) {
 		return send_in_dialog_request(tdata, dlg);
 	} else {
-		return send_out_of_dialog_request(tdata, endpoint, token, callback);
+		return ast_sip_send_out_of_dialog_request(tdata, endpoint, -1, token, callback);
 	}
 }
 
@@ -2767,22 +3379,81 @@ int ast_sip_append_body(pjsip_tx_data *tdata, const char *body_text)
 	return 0;
 }
 
-struct ast_taskprocessor *ast_sip_create_serializer(void)
+struct ast_taskprocessor *ast_sip_create_serializer_group(struct ast_serializer_shutdown_group *shutdown_group)
 {
 	struct ast_taskprocessor *serializer;
 	char name[AST_UUID_STR_LEN];
 
 	ast_uuid_generate_str(name, sizeof(name));
 
-	serializer = ast_threadpool_serializer(name, sip_threadpool);
+	serializer = ast_threadpool_serializer_group(name, sip_threadpool, shutdown_group);
 	if (!serializer) {
 		return NULL;
 	}
 	return serializer;
 }
 
+struct ast_taskprocessor *ast_sip_create_serializer(void)
+{
+	return ast_sip_create_serializer_group(NULL);
+}
+
+/*!
+ * \internal
+ * \brief Shutdown the serializers in the default pool.
+ * \since 14.0.0
+ *
+ * \return Nothing
+ */
+static void serializer_pool_shutdown(void)
+{
+	int idx;
+
+	for (idx = 0; idx < SERIALIZER_POOL_SIZE; ++idx) {
+		ast_taskprocessor_unreference(serializer_pool[idx]);
+		serializer_pool[idx] = NULL;
+	}
+}
+
+/*!
+ * \internal
+ * \brief Setup the serializers in the default pool.
+ * \since 14.0.0
+ *
+ * \retval 0 on success.
+ * \retval -1 on error.
+ */
+static int serializer_pool_setup(void)
+{
+	int idx;
+
+	for (idx = 0; idx < SERIALIZER_POOL_SIZE; ++idx) {
+		serializer_pool[idx] = ast_sip_create_serializer();
+		if (!serializer_pool[idx]) {
+			serializer_pool_shutdown();
+			return -1;
+		}
+	}
+	return 0;
+}
+
 int ast_sip_push_task(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data)
 {
+	if (!serializer) {
+		unsigned int pos;
+
+		/*
+		 * Pick a serializer to use from the pool.
+		 *
+		 * Note: We don't care about any reentrancy behavior
+		 * when incrementing serializer_pool_pos.  If it gets
+		 * incorrectly incremented it doesn't matter.
+		 */
+		pos = serializer_pool_pos++;
+		pos %= SERIALIZER_POOL_SIZE;
+		serializer = serializer_pool[pos];
+	}
+
 	if (serializer) {
 		return ast_taskprocessor_push(serializer, sip_task, task_data);
 	} else {
@@ -2802,13 +3473,22 @@ struct sync_task_data {
 static int sync_task(void *data)
 {
 	struct sync_task_data *std = data;
+	int ret;
+
 	std->fail = std->task(std->task_data);
 
+	/*
+	 * Once we unlock std->lock after signaling, we cannot access
+	 * std again.  The thread waiting within
+	 * ast_sip_push_task_synchronous() is free to continue and
+	 * release its local variable (std).
+	 */
 	ast_mutex_lock(&std->lock);
 	std->complete = 1;
 	ast_cond_signal(&std->cond);
+	ret = std->fail;
 	ast_mutex_unlock(&std->lock);
-	return std->fail;
+	return ret;
 }
 
 int ast_sip_push_task_synchronous(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data)
@@ -2826,18 +3506,10 @@ int ast_sip_push_task_synchronous(struct ast_taskprocessor *serializer, int (*si
 	std.task = sip_task;
 	std.task_data = task_data;
 
-	if (serializer) {
-		if (ast_taskprocessor_push(serializer, sync_task, &std)) {
-			ast_mutex_destroy(&std.lock);
-			ast_cond_destroy(&std.cond);
-			return -1;
-		}
-	} else {
-		if (ast_threadpool_push(sip_threadpool, sync_task, &std)) {
-			ast_mutex_destroy(&std.lock);
-			ast_cond_destroy(&std.cond);
-			return -1;
-		}
+	if (ast_sip_push_task(serializer, sync_task, &std)) {
+		ast_mutex_destroy(&std.lock);
+		ast_cond_destroy(&std.cond);
+		return -1;
 	}
 
 	ast_mutex_lock(&std.lock);
@@ -2970,8 +3642,13 @@ static pj_bool_t supplement_on_rx_request(pjsip_rx_data *rdata)
 
 	AST_RWLIST_RDLOCK(&supplements);
 	AST_LIST_TRAVERSE(&supplements, supplement, next) {
-		if (supplement->incoming_request && does_method_match(&rdata->msg_info.msg->line.req.method.name, supplement->method)) {
-			supplement->incoming_request(ast_pjsip_rdata_get_endpoint(rdata), rdata);
+		if (supplement->incoming_request
+			&& does_method_match(&rdata->msg_info.msg->line.req.method.name, supplement->method)) {
+			struct ast_sip_endpoint *endpoint;
+
+			endpoint = ast_pjsip_rdata_get_endpoint(rdata);
+			supplement->incoming_request(endpoint, rdata);
+			ao2_cleanup(endpoint);
 		}
 	}
 	AST_RWLIST_UNLOCK(&supplements);
@@ -2979,7 +3656,7 @@ static pj_bool_t supplement_on_rx_request(pjsip_rx_data *rdata)
 	return PJ_FALSE;
 }
 
-int ast_sip_send_response(pjsip_response_addr *res_addr, pjsip_tx_data *tdata, struct ast_sip_endpoint *sip_endpoint)
+static void supplement_outgoing_response(pjsip_tx_data *tdata, struct ast_sip_endpoint *sip_endpoint)
 {
 	struct ast_sip_supplement *supplement;
 	pjsip_cseq_hdr *cseq = pjsip_msg_find_hdr(tdata->msg, PJSIP_H_CSEQ, NULL);
@@ -2995,8 +3672,41 @@ int ast_sip_send_response(pjsip_response_addr *res_addr, pjsip_tx_data *tdata, s
 
 	ast_sip_mod_data_set(tdata->pool, tdata->mod_data, supplement_module.id, MOD_DATA_CONTACT, NULL);
 	ao2_cleanup(contact);
+}
+
+int ast_sip_send_response(pjsip_response_addr *res_addr, pjsip_tx_data *tdata, struct ast_sip_endpoint *sip_endpoint)
+{
+	supplement_outgoing_response(tdata, sip_endpoint);
 
 	return pjsip_endpt_send_response(ast_sip_get_pjsip_endpoint(), res_addr, tdata, NULL, NULL);
+}
+
+int ast_sip_send_stateful_response(pjsip_rx_data *rdata, pjsip_tx_data *tdata, struct ast_sip_endpoint *sip_endpoint)
+{
+	pjsip_transaction *tsx;
+
+	if (pjsip_tsx_create_uas(NULL, rdata, &tsx) != PJ_SUCCESS) {
+		struct ast_sip_contact *contact;
+
+		/* ast_sip_create_response bumps the refcount of the contact and adds it to the tdata.
+		 * We'll leak that reference if we don't get rid of it here.
+		 */
+		contact = ast_sip_mod_data_get(tdata->mod_data, supplement_module.id, MOD_DATA_CONTACT);
+		ao2_cleanup(contact);
+		ast_sip_mod_data_set(tdata->pool, tdata->mod_data, supplement_module.id, MOD_DATA_CONTACT, NULL);
+		pjsip_tx_data_dec_ref(tdata);
+		return -1;
+	}
+	pjsip_tsx_recv_msg(tsx, rdata);
+
+	supplement_outgoing_response(tdata, sip_endpoint);
+
+	if (pjsip_tsx_send_msg(tsx, tdata) != PJ_SUCCESS) {
+		pjsip_tx_data_dec_ref(tdata);
+		return -1;
+	}
+
+	return 0;
 }
 
 int ast_sip_create_response(const pjsip_rx_data *rdata, int st_code,
@@ -3011,6 +3721,30 @@ int ast_sip_create_response(const pjsip_rx_data *rdata, int st_code,
 	return res;
 }
 
+int ast_sip_get_host_ip(int af, pj_sockaddr *addr)
+{
+	if (af == pj_AF_INET() && !ast_strlen_zero(host_ip_ipv4_string)) {
+		pj_sockaddr_copy_addr(addr, &host_ip_ipv4);
+		return 0;
+	} else if (af == pj_AF_INET6() && !ast_strlen_zero(host_ip_ipv6_string)) {
+		pj_sockaddr_copy_addr(addr, &host_ip_ipv6);
+		return 0;
+	}
+
+	return -1;
+}
+
+const char *ast_sip_get_host_ip_string(int af)
+{
+	if (af == pj_AF_INET()) {
+		return host_ip_ipv4_string;
+	} else if (af == pj_AF_INET6()) {
+		return host_ip_ipv6_string;
+	}
+
+	return NULL;
+}
+
 static void remove_request_headers(pjsip_endpoint *endpt)
 {
 	const pjsip_hdr *request_headers = pjsip_endpt_get_request_headers(endpt);
@@ -3021,6 +3755,62 @@ static void remove_request_headers(pjsip_endpoint *endpt)
 		iter = iter->next;
 		pj_list_erase(to_erase);
 	}
+}
+
+long ast_sip_threadpool_queue_size(void)
+{
+	return ast_threadpool_queue_size(sip_threadpool);
+}
+
+AST_TEST_DEFINE(xml_sanitization_end_null)
+{
+	char sanitized[8];
+
+	switch (cmd) {
+	case TEST_INIT:
+		info->name = "xml_sanitization_end_null";
+		info->category = "/res/res_pjsip/";
+		info->summary = "Ensure XML sanitization works as expected with a long string";
+		info->description = "This test sanitizes a string which exceeds the output\n"
+			"buffer size. Once done the string is confirmed to be NULL terminated.";
+		return AST_TEST_NOT_RUN;
+	case TEST_EXECUTE:
+		break;
+	}
+
+	ast_sip_sanitize_xml("aaaaaaaaaaaa", sanitized, sizeof(sanitized));
+	if (sanitized[7] != '\0') {
+		ast_test_status_update(test, "Sanitized XML string is not null-terminated when it should be\n");
+		return AST_TEST_FAIL;
+	}
+
+	return AST_TEST_PASS;
+}
+
+AST_TEST_DEFINE(xml_sanitization_exceeds_buffer)
+{
+	char sanitized[8];
+
+	switch (cmd) {
+	case TEST_INIT:
+		info->name = "xml_sanitization_exceeds_buffer";
+		info->category = "/res/res_pjsip/";
+		info->summary = "Ensure XML sanitization does not exceed buffer when output won't fit";
+		info->description = "This test sanitizes a string which before sanitization would\n"
+			"fit within the output buffer. After sanitization, however, the string would\n"
+			"exceed the buffer. Once done the string is confirmed to be NULL terminated.";
+		return AST_TEST_NOT_RUN;
+	case TEST_EXECUTE:
+		break;
+	}
+
+	ast_sip_sanitize_xml("<><><>&", sanitized, sizeof(sanitized));
+	if (sanitized[7] != '\0') {
+		ast_test_status_update(test, "Sanitized XML string is not null-terminated when it should be\n");
+		return AST_TEST_FAIL;
+	}
+
+	return AST_TEST_PASS;
 }
 
 /*!
@@ -3074,6 +3864,16 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	if (!pj_gethostip(pj_AF_INET(), &host_ip_ipv4)) {
+		pj_sockaddr_print(&host_ip_ipv4, host_ip_ipv4_string, sizeof(host_ip_ipv4_string), 2);
+		ast_verb(3, "Local IPv4 address determined to be: %s\n", host_ip_ipv4_string);
+	}
+
+	if (!pj_gethostip(pj_AF_INET6(), &host_ip_ipv6)) {
+		pj_sockaddr_print(&host_ip_ipv6, host_ip_ipv6_string, sizeof(host_ip_ipv6_string), 2);
+		ast_verb(3, "Local IPv6 address determined to be: %s\n", host_ip_ipv6_string);
+	}
+
 	if (ast_sip_initialize_system()) {
 		ast_log(LOG_ERROR, "Failed to initialize SIP 'system' configuration section. Aborting load\n");
 		pj_pool_release(memory_pool);
@@ -3089,6 +3889,18 @@ static int load_module(void)
 	sip_threadpool = ast_threadpool_create("SIP", NULL, &options);
 	if (!sip_threadpool) {
 		ast_log(LOG_ERROR, "Failed to create SIP threadpool. Aborting load\n");
+		ast_sip_destroy_system();
+		pj_pool_release(memory_pool);
+		memory_pool = NULL;
+		pjsip_endpt_destroy(ast_pjsip_endpoint);
+		ast_pjsip_endpoint = NULL;
+		pj_caching_pool_destroy(&caching_pool);
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
+	if (serializer_pool_setup()) {
+		ast_log(LOG_ERROR, "Failed to create SIP serializer pool. Aborting load\n");
+		ast_threadpool_shutdown(sip_threadpool);
 		ast_sip_destroy_system();
 		pj_pool_release(memory_pool);
 		memory_pool = NULL;
@@ -3146,7 +3958,7 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
-	if (ast_sip_register_service(&supplement_module)) {
+	if (internal_sip_register_service(&supplement_module)) {
 		ast_log(LOG_ERROR, "Failed to initialize supplement hooks. Aborting load\n");
 		ast_sip_destroy_distributor();
 		ast_res_pjsip_destroy_configuration();
@@ -3161,9 +3973,9 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
-	if (ast_sip_initialize_outbound_authentication()) {
+	if (internal_sip_initialize_outbound_authentication()) {
 		ast_log(LOG_ERROR, "Failed to initialize outbound authentication. Aborting load\n");
-		ast_sip_unregister_service(&supplement_module);
+		internal_sip_unregister_service(&supplement_module);
 		ast_sip_destroy_distributor();
 		ast_res_pjsip_destroy_configuration();
 		ast_sip_destroy_global_headers();
@@ -3178,15 +3990,21 @@ static int load_module(void)
 	}
 
 	ast_res_pjsip_init_options_handling(0);
+	ast_cli_register_multiple(cli_commands, ARRAY_LEN(cli_commands));
 
-	ast_module_ref(ast_module_info->self);
+	AST_TEST_REGISTER(xml_sanitization_end_null);
+	AST_TEST_REGISTER(xml_sanitization_exceeds_buffer);
 
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
 static int reload_module(void)
 {
-	if (ast_sip_push_task(NULL, reload_configuration_task, NULL)) {
+	/*
+	 * We must wait for the reload to complete so multiple
+	 * reloads cannot happen at the same time.
+	 */
+	if (ast_sip_push_task_synchronous(NULL, reload_configuration_task, NULL)) {
 		ast_log(LOG_WARNING, "Failed to reload PJSIP\n");
 		return -1;
 	}
@@ -3194,9 +4012,43 @@ static int reload_module(void)
 	return 0;
 }
 
+static int unload_pjsip(void *data)
+{
+	ast_cli_unregister_multiple(cli_commands, ARRAY_LEN(cli_commands));
+	ast_res_pjsip_cleanup_options_handling();
+	internal_sip_destroy_outbound_authentication();
+	ast_sip_destroy_distributor();
+	ast_res_pjsip_destroy_configuration();
+	ast_sip_destroy_system();
+	ast_sip_destroy_global_headers();
+	internal_sip_unregister_service(&supplement_module);
+	if (monitor_thread) {
+		stop_monitor_thread();
+	}
+	if (memory_pool) {
+		pj_pool_release(memory_pool);
+		memory_pool = NULL;
+	}
+	ast_pjsip_endpoint = NULL;
+	pj_caching_pool_destroy(&caching_pool);
+	pj_shutdown();
+	return 0;
+}
+
 static int unload_module(void)
 {
-	/* This will never get called as this module can't be unloaded */
+	AST_TEST_UNREGISTER(xml_sanitization_end_null);
+	AST_TEST_UNREGISTER(xml_sanitization_exceeds_buffer);
+
+	/* The thread this is called from cannot call PJSIP/PJLIB functions,
+	 * so we have to push the work to the threadpool to handle
+	 */
+	ast_sip_push_task_synchronous(NULL, unload_pjsip, NULL);
+
+	serializer_pool_shutdown();
+	ast_threadpool_shutdown(sip_threadpool);
+
+	ast_sip_destroy_cli();
 	return 0;
 }
 

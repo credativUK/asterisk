@@ -40,6 +40,7 @@ AST_LIBS+=$(JANSSON_LIB)
 AST_LIBS+=$(URIPARSER_LIB)
 AST_LIBS+=$(UUID_LIB)
 AST_LIBS+=$(CRYPT_LIB)
+AST_LIBS+=$(AST_CLANG_BLOCKS_LIBS)
 
 ifneq ($(findstring $(OSARCH), linux-gnu uclinux linux-uclibc kfreebsd-gnu),)
   ifneq ($(findstring LOADABLE_MODULES,$(MENUSELECT_CFLAGS)),)
@@ -59,7 +60,7 @@ endif
 
 ifneq ($(findstring darwin,$(OSARCH)),)
   AST_LIBS+=-lresolv
-  ASTLINK=-mmacosx-version-min=10.6 -Xlinker -undefined -Xlinker dynamic_lookup -force_flat_namespace
+  ASTLINK=-mmacosx-version-min=10.6 -Wl,-undefined,dynamic_lookup -force_flat_namespace
   ASTLINK+=/usr/lib/bundle1.o
 else
 # These are used for all but Darwin
@@ -185,7 +186,7 @@ ifneq ($(findstring ENABLE_UPLOADS,$(MENUSELECT_CFLAGS)),)
 GMIMELDFLAGS+=$(GMIME_LIB)
 endif
 
-$(OBJS): _ASTCFLAGS+=-DAST_MODULE=\"core\"
+$(OBJS): _ASTCFLAGS+=-DAST_MODULE=\"core\" -DAST_IN_CORE
 
 libasteriskssl.o: _ASTCFLAGS+=$(OPENSSL_INCLUDE)
 

@@ -77,6 +77,10 @@ struct ast_sip_session_media {
 	enum ast_sip_session_media_encryption encryption;
 	/*! \brief The media transport in use for this stream */
 	pj_str_t transport;
+	/*! \brief Scheduler ID for RTP keepalive */
+	int keepalive_sched_id;
+	/*! \brief Scheduler ID for RTP timeout */
+	int timeout_sched_id;
 	/*! \brief Stream is on hold */
 	unsigned int held:1;
 	/*! \brief Stream type this session media handles */
@@ -137,10 +141,14 @@ struct ast_sip_session {
 	struct ast_dsp *dsp;
 	/*! Whether the termination of the session should be deferred */
 	unsigned int defer_terminate:1;
+	/*! Termination requested while termination deferred */
+	unsigned int terminate_while_deferred:1;
 	/*! Deferred incoming re-invite */
 	pjsip_rx_data *deferred_reinvite;
 	/*! Current T.38 state */
 	enum ast_sip_session_t38state t38state;
+	/*! The AOR associated with this session */
+	struct ast_sip_aor *aor;
 };
 
 typedef int (*ast_sip_session_request_creation_cb)(struct ast_sip_session *session, pjsip_tx_data *tdata);
@@ -347,6 +355,12 @@ struct ast_sip_session_sdp_handler {
 	int (*apply_negotiated_sdp_stream)(struct ast_sip_session *session, struct ast_sip_session_media *session_media, const struct pjmedia_sdp_session *local, const struct pjmedia_sdp_media *local_stream,
 		const struct pjmedia_sdp_session *remote, const struct pjmedia_sdp_media *remote_stream);
 	/*!
+	 * \brief Stop a session_media created by this handler but do not destroy resources
+	 * \param session The session for which media is being stopped
+	 * \param session_media The media to destroy
+	 */
+	void (*stream_stop)(struct ast_sip_session_media *session_media);
+	/*!
 	 * \brief Destroy a session_media created by this handler
 	 * \param session The session for which media is being destroyed
 	 * \param session_media The media to destroy
@@ -434,11 +448,29 @@ struct ast_sip_session *ast_sip_session_create_outgoing(struct ast_sip_endpoint 
 	struct ast_format_cap *req_caps);
 
 /*!
+ * \brief Terminate a session and, if possible, send the provided response code
+ *
+ * \param session The session to terminate
+ * \param response The response code to use for termination if possible
+ */
+void ast_sip_session_terminate(struct ast_sip_session *session, int response);
+
+/*!
  * \brief Defer local termination of a session until remote side terminates, or an amount of time passes
  *
  * \param session The session to defer termination on
+ *
+ * \retval 0 Success
+ * \retval -1 Failure
  */
-void ast_sip_session_defer_termination(struct ast_sip_session *session);
+int ast_sip_session_defer_termination(struct ast_sip_session *session);
+
+/*!
+ * \brief Cancel a pending deferred termination.
+ *
+ * \param session The session to cancel a deferred termination on.
+ */
+void ast_sip_session_defer_termination_cancel(struct ast_sip_session *session);
 
 /*!
  * \brief Register an SDP handler

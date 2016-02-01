@@ -38,7 +38,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 422665 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/_private.h"
 #include "asterisk/paths.h"	/* use ast_config_AST_MODULE_DIR */
@@ -487,7 +487,7 @@ static char *handle_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 				return ast_strdup("atleast");
 			}
 #if !defined(LOW_MEMORY)
-		} else if ((a->pos == 4 && !atleast && strcasecmp(argv3, "off"))
+		} else if ((a->pos == 4 && !atleast && strcasecmp(argv3, "off") && strcasecmp(argv3, "channel"))
 			|| (a->pos == 5 && atleast)) {
 			const char *pos = S_OR(a->argv[a->pos], "");
 
@@ -802,7 +802,7 @@ static void print_uptimestr(int fd, struct timeval timeval, const char *prefix, 
 #define DAY (HOUR*24)
 #define WEEK (DAY*7)
 #define YEAR (DAY*365)
-#define NEEDCOMMA(x) ((x)? ",": "")	/* define if we need a comma */
+#define NEEDCOMMA(x) ((x) ? ", " : "")	/* define if we need a comma */
 	if (timeval.tv_sec < 0)	/* invalid, nothing to show */
 		return;
 
@@ -814,31 +814,33 @@ static void print_uptimestr(int fd, struct timeval timeval, const char *prefix, 
 	if (timeval.tv_sec > YEAR) {
 		x = (timeval.tv_sec / YEAR);
 		timeval.tv_sec -= (x * YEAR);
-		ast_str_append(&out, 0, "%d year%s%s ", x, ESS(x),NEEDCOMMA(timeval.tv_sec));
+		ast_str_append(&out, 0, "%d year%s%s", x, ESS(x), NEEDCOMMA(timeval.tv_sec));
 	}
 	if (timeval.tv_sec > WEEK) {
 		x = (timeval.tv_sec / WEEK);
 		timeval.tv_sec -= (x * WEEK);
-		ast_str_append(&out, 0, "%d week%s%s ", x, ESS(x),NEEDCOMMA(timeval.tv_sec));
+		ast_str_append(&out, 0, "%d week%s%s", x, ESS(x), NEEDCOMMA(timeval.tv_sec));
 	}
 	if (timeval.tv_sec > DAY) {
 		x = (timeval.tv_sec / DAY);
 		timeval.tv_sec -= (x * DAY);
-		ast_str_append(&out, 0, "%d day%s%s ", x, ESS(x),NEEDCOMMA(timeval.tv_sec));
+		ast_str_append(&out, 0, "%d day%s%s", x, ESS(x), NEEDCOMMA(timeval.tv_sec));
 	}
 	if (timeval.tv_sec > HOUR) {
 		x = (timeval.tv_sec / HOUR);
 		timeval.tv_sec -= (x * HOUR);
-		ast_str_append(&out, 0, "%d hour%s%s ", x, ESS(x),NEEDCOMMA(timeval.tv_sec));
+		ast_str_append(&out, 0, "%d hour%s%s", x, ESS(x), NEEDCOMMA(timeval.tv_sec));
 	}
 	if (timeval.tv_sec > MINUTE) {
 		x = (timeval.tv_sec / MINUTE);
 		timeval.tv_sec -= (x * MINUTE);
-		ast_str_append(&out, 0, "%d minute%s%s ", x, ESS(x),NEEDCOMMA(timeval.tv_sec));
+		ast_str_append(&out, 0, "%d minute%s%s", x, ESS(x), NEEDCOMMA(timeval.tv_sec));
 	}
 	x = timeval.tv_sec;
-	if (x > 0 || ast_str_strlen(out) == 0)	/* if there is nothing, print 0 seconds */
-		ast_str_append(&out, 0, "%d second%s ", x, ESS(x));
+	if (x > 0 || ast_str_strlen(out) == 0) {
+		/* if there is nothing, print 0 seconds */
+		ast_str_append(&out, 0, "%d second%s", x, ESS(x));
+	}
 	ast_cli(fd, "%s: %s\n", prefix, ast_str_buffer(out));
 }
 
@@ -1074,10 +1076,12 @@ static char *handle_chanlist(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 				char locbuf[40] = "(None)";
 				char appdata[40] = "(None)";
 
-				if (!cs->context && !cs->exten)
+				if (!ast_strlen_zero(cs->context) && !ast_strlen_zero(cs->exten)) {
 					snprintf(locbuf, sizeof(locbuf), "%s@%s:%d", cs->exten, cs->context, cs->priority);
-				if (cs->appl)
+				}
+				if (!ast_strlen_zero(cs->appl)) {
 					snprintf(appdata, sizeof(appdata), "%s(%s)", cs->appl, S_OR(cs->data, ""));
+				}
 				ast_cli(a->fd, FORMAT_STRING, cs->name, locbuf, ast_state2str(cs->state), appdata);
 			}
 		}
@@ -1526,7 +1530,7 @@ static char *handle_showchan(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 	struct ast_var_t *var;
 	struct ast_str *write_transpath = ast_str_alloca(256);
 	struct ast_str *read_transpath = ast_str_alloca(256);
-	struct ast_str *codec_buf = ast_str_alloca(64);
+	struct ast_str *codec_buf = ast_str_alloca(AST_FORMAT_CAP_NAMES_LEN);
 	struct ast_bridge *bridge;
 	struct ast_callid *callid;
 	char callid_buf[32];
@@ -1645,7 +1649,7 @@ static char *handle_showchan(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 		ast_str_buffer(write_transpath),
 		ast_str_strlen(read_transpath) ? "Yes" : "No",
 		ast_str_buffer(read_transpath),
-		ast_channel_whentohangup(chan)->tv_sec,
+		(long)ast_channel_whentohangup(chan)->tv_sec,
 		cdrtime,
 		bridge ? bridge->uniqueid : "(Not bridged)",
 		ast_channel_context(chan),
@@ -2027,7 +2031,7 @@ static void cli_shutdown(void)
 void ast_builtins_init(void)
 {
 	ast_cli_register_multiple(cli_cli, ARRAY_LEN(cli_cli));
-	ast_register_atexit(cli_shutdown);
+	ast_register_cleanup(cli_shutdown);
 }
 
 /*!

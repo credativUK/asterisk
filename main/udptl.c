@@ -63,7 +63,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 417327 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <sys/time.h>
 #include <signal.h>
@@ -362,8 +362,7 @@ static int encode_open_type(const struct ast_udptl *udptl, uint8_t *buf, unsigne
 	}
 	/* Encode the open type */
 	for (octet_idx = 0; ; num_octets -= enclen, octet_idx += enclen) {
-		if ((enclen = encode_length(buf, len, num_octets)) < 0)
-			return -1;
+		enclen = encode_length(buf, len, num_octets);
 		if (enclen + *len > buflen) {
 			ast_log(LOG_ERROR, "UDPTL (%s): Buffer overflow detected (%u + %u > %u)\n",
 				LOG_TAG(udptl), enclen, *len, buflen);
@@ -520,7 +519,7 @@ static int udptl_rx_packet(struct ast_udptl *s, uint8_t *buf, unsigned int len)
 #if 0
 			fprintf(stderr, "FEC: ");
 			for (j = 0; j < s->rx[x].fec_len[i]; j++)
-				fprintf(stderr, "%02X ", data[j]);
+				fprintf(stderr, "%02hhX ", data[j]);
 			fprintf(stderr, "\n");
 #endif
 		}
@@ -646,8 +645,7 @@ static int udptl_build_packet(struct ast_udptl *s, uint8_t *buf, unsigned int bu
 		buf[len++] = 0x00;
 		/* The number of entries will always be zero, so it is pointless allowing
 		   for the fragmented case here. */
-		if (encode_length(buf, &len, 0) < 0)
-			return -1;
+		encode_length(buf, &len, 0);
 		break;
 	case UDPTL_ERROR_CORRECTION_REDUNDANCY:
 		/* Encode the error recovery type */
@@ -658,8 +656,7 @@ static int udptl_build_packet(struct ast_udptl *s, uint8_t *buf, unsigned int bu
 			entries = s->tx_seq_no;
 		/* The number of entries will always be small, so it is pointless allowing
 		   for the fragmented case here. */
-		if (encode_length(buf, &len, entries) < 0)
-			return -1;
+		encode_length(buf, &len, entries);
 		/* Encode the elements */
 		for (i = 0; i < entries; i++) {
 			j = (entry - i - 1) & UDPTL_BUF_MASK;
@@ -1403,5 +1400,5 @@ void ast_udptl_init(void)
 
 	ast_cli_register_multiple(cli_udptl, ARRAY_LEN(cli_udptl));
 
-	ast_register_atexit(udptl_shutdown);
+	ast_register_cleanup(udptl_shutdown);
 }

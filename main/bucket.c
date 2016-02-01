@@ -60,7 +60,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 413589 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #ifdef HAVE_URIPARSER
 #include <uriparser/Uri.h>
@@ -282,7 +282,7 @@ int __ast_bucket_scheme_register(const char *name, struct ast_sorcery_wizard *bu
 
 	ast_verb(2, "Registered bucket scheme '%s'\n", name);
 
-	ast_module_ref(module);
+	ast_module_shutdown_ref(module);
 
 	return 0;
 }
@@ -882,9 +882,8 @@ static int bucket_scheme_cmp(void *obj, void *arg, int flags)
 /*! \brief Cleanup function for graceful shutdowns */
 static void bucket_cleanup(void)
 {
-	if (bucket_sorcery) {
-		ast_sorcery_unref(bucket_sorcery);
-	}
+	ast_sorcery_unref(bucket_sorcery);
+	bucket_sorcery = NULL;
 
 	ast_sorcery_wizard_unregister(&bucket_wizard);
 	ast_sorcery_wizard_unregister(&bucket_file_wizard);

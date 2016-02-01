@@ -30,7 +30,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 421880 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/dsp.h"
 #include "asterisk/file.h"
@@ -91,9 +91,9 @@ static struct ast_json *recording_to_json(struct stasis_message *message,
 		return NULL;
 	}
 
-	return ast_json_pack("{s: s, s: O}",
+	return ast_json_pack("{s: s, s: o}",
 		"type", type,
-		"recording", blob);
+		"recording", ast_json_deep_copy(blob));
 }
 
 STASIS_MESSAGE_TYPE_DEFN(stasis_app_recording_snapshot_type,
@@ -212,7 +212,7 @@ enum ast_record_if_exists stasis_app_recording_if_exists_parse(
 		return AST_RECORD_IF_EXISTS_APPEND;
 	}
 
-	return -1;
+	return AST_RECORD_IF_EXISTS_ERROR;
 }
 
 static void recording_publish(struct stasis_app_recording *recording, const char *cause)
@@ -595,13 +595,13 @@ enum stasis_app_recording_oper_results stasis_app_recording_operation(
 	recording_operation_cb cb;
 	SCOPED_AO2LOCK(lock, recording);
 
-	if (recording->state < 0 || recording->state >= STASIS_APP_RECORDING_STATE_MAX) {
+	if ((unsigned int)recording->state >= STASIS_APP_RECORDING_STATE_MAX) {
 		ast_log(LOG_WARNING, "Invalid recording state %u\n",
 			recording->state);
 		return -1;
 	}
 
-	if (operation < 0 || operation >= STASIS_APP_RECORDING_OPER_MAX) {
+	if ((unsigned int)operation >= STASIS_APP_RECORDING_OPER_MAX) {
 		ast_log(LOG_WARNING, "Invalid recording operation %u\n",
 			operation);
 		return -1;

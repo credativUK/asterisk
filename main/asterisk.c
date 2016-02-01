@@ -149,7 +149,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419044 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/_private.h"
 
@@ -171,11 +171,9 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419044 $")
 #elif defined(HAVE_SYSCTL)
 #include <sys/param.h>
 #include <sys/sysctl.h>
-#if !defined(__OpenBSD__)
 #include <sys/vmmeter.h>
 #if defined(__FreeBSD__)
 #include <vm/vm_param.h>
-#endif
 #endif
 #if defined(HAVE_SWAPCTL)
 #include <sys/swap.h>
@@ -374,9 +372,14 @@ struct console consoles[AST_MAX_CONNECTS];
 
 char ast_defaultlanguage[MAX_LANGUAGE] = DEFAULT_LANGUAGE;
 
-static int ast_el_add_history(char *);
-static int ast_el_read_history(char *);
-static int ast_el_write_history(char *);
+static int ast_el_add_history(const char *);
+static int ast_el_read_history(const char *);
+static int ast_el_write_history(const char *);
+
+static void ast_el_read_default_histfile(void);
+static void ast_el_write_default_histfile(void);
+
+static void asterisk_daemon(int isroot, const char *runuser, const char *rungroup);
 
 struct _cfg_paths {
 	char config_dir[PATH_MAX];
@@ -432,16 +435,34 @@ static char ast_config_AST_CTL[PATH_MAX] = "asterisk.ctl";
 extern unsigned int ast_FD_SETSIZE;
 
 static char *_argv[256];
+
 typedef enum {
-	NOT_SHUTTING_DOWN = -2,
-	SHUTTING_DOWN = -1,
-	/* Valid values for quit_handler niceness below: */
+	/*! Normal operation */
+	NOT_SHUTTING_DOWN,
+	/*! Committed to shutting down.  Final phase */
+	SHUTTING_DOWN_FINAL,
+	/*! Committed to shutting down.  Initial phase */
+	SHUTTING_DOWN,
+	/*!
+	 * Valid values for quit_handler() niceness below.
+	 * These shutdown/restart levels can be cancelled.
+	 *
+	 * Remote console exit right now
+	 */
 	SHUTDOWN_FAST,
+	/*! core stop/restart now */
 	SHUTDOWN_NORMAL,
+	/*! core stop/restart gracefully */
 	SHUTDOWN_NICE,
+	/*! core stop/restart when convenient */
 	SHUTDOWN_REALLY_NICE
 } shutdown_nice_t;
+
 static shutdown_nice_t shuttingdown = NOT_SHUTTING_DOWN;
+
+/*! Prevent new channel allocation for shutdown. */
+static int shutdown_pending;
+
 static int restartnow;
 static pthread_t consolethread = AST_PTHREADT_NULL;
 static pthread_t mon_sig_flags;
@@ -459,84 +480,79 @@ static struct {
 } sig_flags;
 
 #if !defined(LOW_MEMORY)
-struct file_version {
-	AST_RWLIST_ENTRY(file_version) list;
+struct registered_file {
+	AST_RWLIST_ENTRY(registered_file) list;
 	const char *file;
-	char *version;
 };
 
-static AST_RWLIST_HEAD_STATIC(file_versions, file_version);
+static AST_RWLIST_HEAD_STATIC(registered_files, registered_file);
 
 void ast_register_file_version(const char *file, const char *version)
 {
-	struct file_version *new;
-	char *work;
-	size_t version_length;
+	struct registered_file *reg;
 
-	work = ast_strdupa(version);
-	work = ast_strip(ast_strip_quoted(work, "$", "$"));
-	version_length = strlen(work) + 1;
-
-	if (!(new = ast_calloc(1, sizeof(*new) + version_length)))
+	reg = ast_calloc(1, sizeof(*reg));
+	if (!reg) {
 		return;
+	}
 
-	new->file = file;
-	new->version = (char *) new + sizeof(*new);
-	memcpy(new->version, work, version_length);
-	AST_RWLIST_WRLOCK(&file_versions);
-	AST_RWLIST_INSERT_HEAD(&file_versions, new, list);
-	AST_RWLIST_UNLOCK(&file_versions);
+	reg->file = file;
+	AST_RWLIST_WRLOCK(&registered_files);
+	AST_RWLIST_INSERT_HEAD(&registered_files, reg, list);
+	AST_RWLIST_UNLOCK(&registered_files);
 }
 
 void ast_unregister_file_version(const char *file)
 {
-	struct file_version *find;
+	struct registered_file *find;
 
-	AST_RWLIST_WRLOCK(&file_versions);
-	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&file_versions, find, list) {
+	AST_RWLIST_WRLOCK(&registered_files);
+	AST_RWLIST_TRAVERSE_SAFE_BEGIN(&registered_files, find, list) {
 		if (!strcasecmp(find->file, file)) {
 			AST_RWLIST_REMOVE_CURRENT(list);
 			break;
 		}
 	}
 	AST_RWLIST_TRAVERSE_SAFE_END;
-	AST_RWLIST_UNLOCK(&file_versions);
+	AST_RWLIST_UNLOCK(&registered_files);
 
-	if (find)
+	if (find) {
 		ast_free(find);
+	}
 }
 
 char *ast_complete_source_filename(const char *partial, int n)
 {
-	struct file_version *find;
+	struct registered_file *find;
 	size_t len = strlen(partial);
 	int count = 0;
 	char *res = NULL;
 
-	AST_RWLIST_RDLOCK(&file_versions);
-	AST_RWLIST_TRAVERSE(&file_versions, find, list) {
+	AST_RWLIST_RDLOCK(&registered_files);
+	AST_RWLIST_TRAVERSE(&registered_files, find, list) {
 		if (!strncasecmp(find->file, partial, len) && ++count > n) {
 			res = ast_strdup(find->file);
 			break;
 		}
 	}
-	AST_RWLIST_UNLOCK(&file_versions);
+	AST_RWLIST_UNLOCK(&registered_files);
 	return res;
 }
 
-/*! \brief Find version for given module name */
 const char *ast_file_version_find(const char *file)
 {
-	struct file_version *iterator;
+	struct registered_file *iterator;
 
-	AST_RWLIST_WRLOCK(&file_versions);
-	AST_RWLIST_TRAVERSE(&file_versions, iterator, list) {
-		if (!strcasecmp(iterator->file, file))
+	AST_RWLIST_RDLOCK(&registered_files);
+	AST_RWLIST_TRAVERSE(&registered_files, iterator, list) {
+		if (!strcasecmp(iterator->file, file)) {
 			break;
+		}
 	}
-	AST_RWLIST_UNLOCK(&file_versions);
-	if (iterator)
-		return iterator->version;
+	AST_RWLIST_UNLOCK(&registered_files);
+	if (iterator) {
+		return ast_get_version();
+	}
 	return NULL;
 }
 
@@ -606,7 +622,7 @@ static char *handle_show_settings(struct ast_cli_entry *e, int cmd, struct ast_c
 	ast_cli(a->fd, "\nPBX Core settings\n");
 	ast_cli(a->fd, "-----------------\n");
 	ast_cli(a->fd, "  Version:                     %s\n", ast_get_version());
-	ast_cli(a->fd, "  Build Options:               %s\n", S_OR(AST_BUILDOPTS, "(none)"));
+	ast_cli(a->fd, "  Build Options:               %s\n", S_OR(ast_get_build_opts(), "(none)"));
 	if (ast_option_maxcalls)
 		ast_cli(a->fd, "  Maximum calls:               %d (Current %d)\n", ast_option_maxcalls, ast_active_channels());
 	else
@@ -1019,35 +1035,35 @@ static char *handle_clear_profile(struct ast_cli_entry *e, int cmd, struct ast_c
 static char *handle_show_version_files(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 #define FORMAT "%-25.25s %-40.40s\n"
-	struct file_version *iterator;
+	struct registered_file *iterator;
 	regex_t regexbuf;
 	int havepattern = 0;
 	int havename = 0;
 	int count_files = 0;
 	char *ret = NULL;
 	int matchlen, which = 0;
-	struct file_version *find;
+	struct registered_file *find;
 
 	switch (cmd) {
 	case CLI_INIT:
 		e->command = "core show file version [like]";
 		e->usage =
 			"Usage: core show file version [like <pattern>]\n"
-			"       Lists the revision numbers of the files used to build this copy of Asterisk.\n"
+			"       Lists the files along with the Asterisk version.\n"
 			"       Optional regular expression pattern is used to filter the file list.\n";
 		return NULL;
 	case CLI_GENERATE:
 		matchlen = strlen(a->word);
 		if (a->pos != 3)
 			return NULL;
-		AST_RWLIST_RDLOCK(&file_versions);
-		AST_RWLIST_TRAVERSE(&file_versions, find, list) {
+		AST_RWLIST_RDLOCK(&registered_files);
+		AST_RWLIST_TRAVERSE(&registered_files, find, list) {
 			if (!strncasecmp(a->word, find->file, matchlen) && ++which > a->n) {
 				ret = ast_strdup(find->file);
 				break;
 			}
 		}
-		AST_RWLIST_UNLOCK(&file_versions);
+		AST_RWLIST_UNLOCK(&registered_files);
 		return ret;
 	}
 
@@ -1072,20 +1088,20 @@ static char *handle_show_version_files(struct ast_cli_entry *e, int cmd, struct 
 
 	ast_cli(a->fd, FORMAT, "File", "Revision");
 	ast_cli(a->fd, FORMAT, "----", "--------");
-	AST_RWLIST_RDLOCK(&file_versions);
-	AST_RWLIST_TRAVERSE(&file_versions, iterator, list) {
+	AST_RWLIST_RDLOCK(&registered_files);
+	AST_RWLIST_TRAVERSE(&registered_files, iterator, list) {
 		if (havename && strcasecmp(iterator->file, a->argv[4]))
 			continue;
 
 		if (havepattern && regexec(&regexbuf, iterator->file, 0, NULL, 0))
 			continue;
 
-		ast_cli(a->fd, FORMAT, iterator->file, iterator->version);
+		ast_cli(a->fd, FORMAT, iterator->file, ast_get_version());
 		count_files++;
 		if (havename)
 			break;
 	}
-	AST_RWLIST_UNLOCK(&file_versions);
+	AST_RWLIST_UNLOCK(&registered_files);
 	if (!havename) {
 		ast_cli(a->fd, "%d files listed.\n", count_files);
 	}
@@ -1867,6 +1883,43 @@ int ast_set_priority(int pri)
 	return 0;
 }
 
+int ast_shutdown_final(void)
+{
+	return shuttingdown == SHUTTING_DOWN_FINAL;
+}
+
+int ast_shutting_down(void)
+{
+	return shutdown_pending;
+}
+
+int ast_cancel_shutdown(void)
+{
+	int shutdown_aborted = 0;
+
+	ast_mutex_lock(&safe_system_lock);
+	if (shuttingdown >= SHUTDOWN_FAST) {
+		shuttingdown = NOT_SHUTTING_DOWN;
+		shutdown_pending = 0;
+		shutdown_aborted = 1;
+	}
+	ast_mutex_unlock(&safe_system_lock);
+	return shutdown_aborted;
+}
+
+/*!
+ * \internal
+ * \brief Initiate system shutdown -- prevents new channels from being allocated.
+ */
+static void ast_begin_shutdown(void)
+{
+	ast_mutex_lock(&safe_system_lock);
+	if (shuttingdown != NOT_SHUTTING_DOWN) {
+		shutdown_pending = 1;
+	}
+	ast_mutex_unlock(&safe_system_lock);
+}
+
 static int can_safely_quit(shutdown_nice_t niceness, int restart);
 static void really_quit(int num, shutdown_nice_t niceness, int restart);
 
@@ -1879,8 +1932,53 @@ static void quit_handler(int num, shutdown_nice_t niceness, int restart)
 	/* It wasn't our time. */
 }
 
+#define SHUTDOWN_TIMEOUT	15	/* Seconds */
+
+/*!
+ * \internal
+ * \brief Wait for all channels to die, a timeout, or shutdown cancelled.
+ * \since 13.3.0
+ *
+ * \param niceness Shutdown niceness in effect
+ * \param seconds Number of seconds to wait or less than zero if indefinitely.
+ *
+ * \retval zero if waiting wasn't necessary.  We were idle.
+ * \retval non-zero if we had to wait.
+ */
+static int wait_for_channels_to_die(shutdown_nice_t niceness, int seconds)
+{
+	time_t start;
+	time_t now;
+	int waited = 0;
+
+	time(&start);
+	for (;;) {
+		if (!ast_undestroyed_channels() || shuttingdown != niceness) {
+			break;
+		}
+		if (seconds < 0) {
+			/* No timeout so just poll every second */
+			sleep(1);
+		} else {
+			time(&now);
+
+			/* Wait up to the given seconds for all channels to go away */
+			if (seconds < (now - start)) {
+				break;
+			}
+
+			/* Sleep 1/10 of a second */
+			usleep(100000);
+		}
+		waited = 1;
+	}
+	return waited;
+}
+
 static int can_safely_quit(shutdown_nice_t niceness, int restart)
 {
+	int waited = 0;
+
 	/* Check if someone else isn't already doing this. */
 	ast_mutex_lock(&safe_system_lock);
 	if (shuttingdown != NOT_SHUTTING_DOWN && niceness >= shuttingdown) {
@@ -1897,40 +1995,30 @@ static int can_safely_quit(shutdown_nice_t niceness, int restart)
 	 * the atexit handlers, otherwise this would be a bit early. */
 	ast_cdr_engine_term();
 
-	/* Shutdown the message queue for the technology agnostic message channel.
-	 * This has to occur before we pause shutdown pending ast_undestroyed_channels. */
+	/*
+	 * Shutdown the message queue for the technology agnostic message channel.
+	 * This has to occur before we pause shutdown pending ast_undestroyed_channels.
+	 *
+	 * XXX This is not reversed on shutdown cancel.
+	 */
 	ast_msg_shutdown();
 
 	if (niceness == SHUTDOWN_NORMAL) {
-		time_t s, e;
 		/* Begin shutdown routine, hanging up active channels */
-		ast_begin_shutdown(1);
+		ast_begin_shutdown();
 		if (ast_opt_console) {
 			ast_verb(0, "Beginning asterisk %s....\n", restart ? "restart" : "shutdown");
 		}
-		time(&s);
-		for (;;) {
-			time(&e);
-			/* Wait up to 15 seconds for all channels to go away */
-			if ((e - s) > 15 || !ast_undestroyed_channels() || shuttingdown != niceness) {
-				break;
-			}
-			/* Sleep 1/10 of a second */
-			usleep(100000);
-		}
+		ast_softhangup_all();
+		waited |= wait_for_channels_to_die(niceness, SHUTDOWN_TIMEOUT);
 	} else if (niceness >= SHUTDOWN_NICE) {
 		if (niceness != SHUTDOWN_REALLY_NICE) {
-			ast_begin_shutdown(0);
+			ast_begin_shutdown();
 		}
 		if (ast_opt_console) {
 			ast_verb(0, "Waiting for inactivity to perform %s...\n", restart ? "restart" : "halt");
 		}
-		for (;;) {
-			if (!ast_undestroyed_channels() || shuttingdown != niceness) {
-				break;
-			}
-			sleep(1);
-		}
+		waited |= wait_for_channels_to_die(niceness, -1);
 	}
 
 	/* Re-acquire lock and check if someone changed the niceness, in which
@@ -1944,9 +2032,28 @@ static int can_safely_quit(shutdown_nice_t niceness, int restart)
 		ast_mutex_unlock(&safe_system_lock);
 		return 0;
 	}
-	shuttingdown = SHUTTING_DOWN;
+
+	if (niceness >= SHUTDOWN_REALLY_NICE) {
+		shuttingdown = SHUTTING_DOWN;
+		ast_mutex_unlock(&safe_system_lock);
+
+		/* No more Mr. Nice guy.  We are committed to shutting down now. */
+		ast_begin_shutdown();
+		ast_softhangup_all();
+		waited |= wait_for_channels_to_die(SHUTTING_DOWN, SHUTDOWN_TIMEOUT);
+
+		ast_mutex_lock(&safe_system_lock);
+	}
+	shuttingdown = SHUTTING_DOWN_FINAL;
 	ast_mutex_unlock(&safe_system_lock);
 
+	if (niceness >= SHUTDOWN_NORMAL && waited) {
+		/*
+		 * We were not idle.  Give things in progress a chance to
+		 * recognize the final shutdown phase.
+		 */
+		sleep(1);
+	}
 	return 1;
 }
 
@@ -1962,13 +2069,7 @@ static void really_quit(int num, shutdown_nice_t niceness, int restart)
 	}
 
 	if (ast_opt_console || (ast_opt_remote && !ast_opt_exec)) {
-		char filename[80] = "";
-		if (getenv("HOME")) {
-			snprintf(filename, sizeof(filename), "%s/.asterisk_history", getenv("HOME"));
-		}
-		if (!ast_strlen_zero(filename)) {
-			ast_el_write_history(filename);
-		}
+		ast_el_write_default_histfile();
 		if (consolethread == AST_PTHREADT_NULL || consolethread == pthread_self()) {
 			/* Only end if we are the consolethread, otherwise there's a race with that thread. */
 			if (el != NULL) {
@@ -2199,7 +2300,7 @@ static void console_verboser(const char *s)
 	}
 }
 
-static int ast_all_zeros(char *s)
+static int ast_all_zeros(const char *s)
 {
 	while (*s) {
 		if (*s > 32)
@@ -2210,7 +2311,7 @@ static int ast_all_zeros(char *s)
 }
 
 /* This is the main console CLI command handler.  Run by the main() thread. */
-static void consolehandler(char *s)
+static void consolehandler(const char *s)
 {
 	printf("%s", term_end());
 	fflush(stdout);
@@ -2228,7 +2329,7 @@ static void consolehandler(char *s)
 		ast_cli_command(STDOUT_FILENO, s);
 }
 
-static int remoteconsolehandler(char *s)
+static int remoteconsolehandler(const char *s)
 {
 	int ret = 0;
 
@@ -2454,8 +2555,6 @@ static char *handle_restart_when_convenient(struct ast_cli_entry *e, int cmd, st
 
 static char *handle_abort_shutdown(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
-	int aborting_shutdown = 0;
-
 	switch (cmd) {
 	case CLI_INIT:
 		e->command = "core abort shutdown";
@@ -2471,16 +2570,8 @@ static char *handle_abort_shutdown(struct ast_cli_entry *e, int cmd, struct ast_
 	if (a->argc != e->args)
 		return CLI_SHOWUSAGE;
 
-	ast_mutex_lock(&safe_system_lock);
-	if (shuttingdown >= SHUTDOWN_FAST) {
-		aborting_shutdown = 1;
-		shuttingdown = NOT_SHUTTING_DOWN;
-	}
-	ast_mutex_unlock(&safe_system_lock);
+	ast_cancel_shutdown();
 
-	if (aborting_shutdown) {
-		ast_cancel_shutdown();
-	}
 	return CLI_SUCCESS;
 }
 
@@ -3155,7 +3246,7 @@ static int ast_el_initialize(void)
 
 #define MAX_HISTORY_COMMAND_LENGTH 256
 
-static int ast_el_add_history(char *buf)
+static int ast_el_add_history(const char *buf)
 {
 	HistEvent ev;
 	char *stripped_buf;
@@ -3177,7 +3268,7 @@ static int ast_el_add_history(char *buf)
 	return history(el_hist, &ev, H_ENTER, stripped_buf);
 }
 
-static int ast_el_write_history(char *filename)
+static int ast_el_write_history(const char *filename)
 {
 	HistEvent ev;
 
@@ -3187,7 +3278,7 @@ static int ast_el_write_history(char *filename)
 	return (history(el_hist, &ev, H_SAVE, filename));
 }
 
-static int ast_el_read_history(char *filename)
+static int ast_el_read_history(const char *filename)
 {
 	HistEvent ev;
 
@@ -3198,11 +3289,32 @@ static int ast_el_read_history(char *filename)
 	return history(el_hist, &ev, H_LOAD, filename);
 }
 
+static void ast_el_read_default_histfile(void)
+{
+	char histfile[80] = "";
+	const char *home = getenv("HOME");
+
+	if (!ast_strlen_zero(home)) {
+		snprintf(histfile, sizeof(histfile), "%s/.asterisk_history", home);
+		ast_el_read_history(histfile);
+	}
+}
+
+static void ast_el_write_default_histfile(void)
+{
+	char histfile[80] = "";
+	const char *home = getenv("HOME");
+
+	if (!ast_strlen_zero(home)) {
+		snprintf(histfile, sizeof(histfile), "%s/.asterisk_history", home);
+		ast_el_write_history(histfile);
+	}
+}
+
 static void ast_remotecontrol(char *data)
 {
-	char buf[80];
+	char buf[256] = "";
 	int res;
-	char filename[80] = "";
 	char *hostname;
 	char *cpid;
 	char *version;
@@ -3212,12 +3324,16 @@ static void ast_remotecontrol(char *data)
 	char *ebuf;
 	int num = 0;
 
+	ast_term_init();
+	printf("%s", term_end());
+	fflush(stdout);
+
 	memset(&sig_flags, 0, sizeof(sig_flags));
 	signal(SIGINT, __remote_quit_handler);
 	signal(SIGTERM, __remote_quit_handler);
 	signal(SIGHUP, __remote_quit_handler);
 
-	if (read(ast_consock, buf, sizeof(buf)) < 0) {
+	if (read(ast_consock, buf, sizeof(buf) - 1) < 0) {
 		ast_log(LOG_ERROR, "read() failed: %s\n", strerror(errno));
 		return;
 	}
@@ -3310,15 +3426,11 @@ static void ast_remotecontrol(char *data)
 
 	ast_verbose("Connected to Asterisk %s currently running on %s (pid = %d)\n", version, hostname, pid);
 	remotehostname = hostname;
-	if (getenv("HOME"))
-		snprintf(filename, sizeof(filename), "%s/.asterisk_history", getenv("HOME"));
 	if (el_hist == NULL || el == NULL)
 		ast_el_initialize();
+	ast_el_read_default_histfile();
 
 	el_set(el, EL_GETCFN, ast_el_read_char);
-
-	if (!ast_strlen_zero(filename))
-		ast_el_read_history(filename);
 
 	for (;;) {
 		ebuf = (char *)el_gets(el, &num);
@@ -3501,7 +3613,7 @@ static void ast_readconfig(void)
 		} else if (!strcasecmp(v->name, "debug")) {
 			option_debug = 0;
 			if (sscanf(v->value, "%30d", &option_debug) != 1) {
-				option_debug = ast_true(v->value);
+				option_debug = ast_true(v->value) ? 1 : 0;
 			}
 #if HAVE_WORKING_FORK
 		/* Disable forking (-f at startup) */
@@ -3778,18 +3890,11 @@ static void main_atexit(void)
 int main(int argc, char *argv[])
 {
 	int c;
-	char filename[80] = "";
-	char hostname[MAXHOSTNAMELEN] = "";
 	char * xarg = NULL;
 	int x;
-	FILE *f;
-	sigset_t sigs;
-	int num;
 	int isroot = 1, rundir_exists = 0;
-	char *buf;
 	const char *runuser = NULL, *rungroup = NULL;
 	char *remotesock = NULL;
-	int moduleresult;         /*!< Result from the module load subsystem */
 	struct rlimit l;
 
 	/* Remember original args for restart */
@@ -3808,12 +3913,8 @@ int main(int argc, char *argv[])
 	if (argv[0] && (strstr(argv[0], "rasterisk")) != NULL) {
 		ast_set_flag(&ast_options, AST_OPT_FLAG_NO_FORK | AST_OPT_FLAG_REMOTE);
 	}
-	if (gethostname(hostname, sizeof(hostname)-1))
-		ast_copy_string(hostname, "<Unknown>", sizeof(hostname));
 	ast_mainpid = getpid();
 
-	if (getenv("HOME"))
-		snprintf(filename, sizeof(filename), "%s/.asterisk_history", getenv("HOME"));
 	/*! \brief Check for options
 	 *
 	 * \todo Document these options
@@ -4157,6 +4258,10 @@ int main(int argc, char *argv[])
 				quit_handler(0, SHUTDOWN_FAST, 0);
 				exit(0);
 			}
+			ast_term_init();
+			printf("%s", term_end());
+			fflush(stdout);
+
 			print_intro_message(runuser, rungroup);
 			printf("%s", term_quit());
 			ast_remotecontrol(NULL);
@@ -4172,6 +4277,19 @@ int main(int argc, char *argv[])
 		printf("%s", term_quit());
 		exit(1);
 	}
+
+	/* Not a remote console? Start the daemon. */
+	asterisk_daemon(isroot, runuser, rungroup);
+	return 0;
+}
+
+static void asterisk_daemon(int isroot, const char *runuser, const char *rungroup)
+{
+	FILE *f;
+	sigset_t sigs;
+	int num;
+	char *buf;
+	int moduleresult;         /*!< Result from the module load subsystem */
 
 	/* This needs to remain as high up in the initial start up as possible.
 	 * daemon causes a fork to occur, which has all sorts of unintended
@@ -4261,14 +4379,15 @@ int main(int argc, char *argv[])
 	register_config_cli();
 	read_config_maps();
 
-	astobj2_init();
+	if (astobj2_init()) {
+		printf("Failed: astobj2_init\n%s", term_quit());
+		exit(1);
+	}
 
 	if (ast_opt_console) {
 		if (el_hist == NULL || el == NULL)
 			ast_el_initialize();
-
-		if (!ast_strlen_zero(filename))
-			ast_el_read_history(filename);
+		ast_el_read_default_histfile();
 	}
 
 	ast_json_init();
@@ -4279,34 +4398,34 @@ int main(int argc, char *argv[])
 	ast_builtins_init();
 
 	if (ast_utils_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_utils_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_tps_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_tps_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_fd_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_fd_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_pbx_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_pbx_init\n%s", term_quit());
 		exit(1);
 	}
 
 #ifdef TEST_FRAMEWORK
 	if (ast_test_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_test_init\n%s", term_quit());
 		exit(1);
 	}
 #endif
 
 	if (ast_translate_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_translate_init\n%s", term_quit());
 		exit(1);
 	}
 
@@ -4314,27 +4433,27 @@ int main(int argc, char *argv[])
 	ast_uuid_init();
 
 	if (ast_sorcery_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_sorcery_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_codec_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_codec_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_format_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_format_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_format_cache_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_format_cache_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_codec_builtin_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_codec_builtin_init\n%s", term_quit());
 		exit(1);
 	}
 
@@ -4346,7 +4465,7 @@ int main(int argc, char *argv[])
 	aco_init();
 
 	if (ast_bucket_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_bucket_init\n%s", term_quit());
 		exit(1);
 	}
 
@@ -4366,12 +4485,14 @@ int main(int argc, char *argv[])
 	}
 
 	ast_makesocket();
-	sigemptyset(&sigs);
-	sigaddset(&sigs, SIGHUP);
-	sigaddset(&sigs, SIGTERM);
-	sigaddset(&sigs, SIGINT);
-	sigaddset(&sigs, SIGPIPE);
-	sigaddset(&sigs, SIGWINCH);
+	/* GCC 4.9 gives a bogus "right-hand operand of comma expression has
+	 * no effect" warning */
+	(void) sigemptyset(&sigs);
+	(void) sigaddset(&sigs, SIGHUP);
+	(void) sigaddset(&sigs, SIGTERM);
+	(void) sigaddset(&sigs, SIGINT);
+	(void) sigaddset(&sigs, SIGPIPE);
+	(void) sigaddset(&sigs, SIGWINCH);
 	pthread_sigmask(SIG_BLOCK, &sigs, NULL);
 	sigaction(SIGURG, &urg_handler, NULL);
 	signal(SIGINT, __quit_handler);
@@ -4386,26 +4507,26 @@ int main(int argc, char *argv[])
 	initstate((unsigned int) getpid() * 65536 + (unsigned int) time(NULL), randompool, sizeof(randompool));
 
 	if (init_logger()) {		/* Start logging subsystem */
-		printf("%s", term_quit());
+		printf("Failed: init_logger\n%s", term_quit());
 		exit(1);
 	}
 
 	threadstorage_init();
 
 	if (ast_rtp_engine_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_rtp_engine_init\n%s", term_quit());
 		exit(1);
 	}
 
 	ast_autoservice_init();
 
 	if (ast_timing_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_timing_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_ssl_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_ssl_init\n%s", term_quit());
 		exit(1);
 	}
 
@@ -4420,87 +4541,87 @@ int main(int argc, char *argv[])
 	}
 
 	if (astdb_init()) {
-		printf("%s", term_quit());
+		printf("Failed: astdb_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_msg_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_msg_init\n%s", term_quit());
 		exit(1);
 	}
 
 	/* initialize the data retrieval API */
 	if (ast_data_init()) {
-		printf ("%s", term_quit());
+		printf("Failed: ast_data_init\n%s", term_quit());
 		exit(1);
 	}
 
 	ast_channels_init();
 
 	if (ast_endpoint_init()) {
-		printf ("%s", term_quit());
+		printf ("Failed: ast_endpoint_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_pickup_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_pickup_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_bridging_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_bridging_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_parking_stasis_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_parking_stasis_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_device_state_engine_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_device_state_engine_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_presence_state_engine_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_presence_state_engine_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if ((moduleresult = load_modules(1))) {		/* Load modules, pre-load only */
-		printf("%s", term_quit());
+		printf("Failed: load_modules\n%s", term_quit());
 		exit(moduleresult == -2 ? 2 : 1);
 	}
 
 	if (ast_features_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_features_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (dnsmgr_init()) {		/* Initialize the DNS manager */
-		printf("%s", term_quit());
+		printf("Failed: dnsmgr_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_security_stasis_init()) {		/* Initialize Security Stasis Topic and Events */
-		printf("%s", term_quit());
+		printf("Failed: ast_security_stasis_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_named_acl_init()) { /* Initialize the Named ACL system */
-		printf("%s", term_quit());
+		printf("Failed: ast_named_acl_init\n%s", term_quit());
 		exit(1);
 	}
 
 	ast_http_init();		/* Start the HTTP server, if needed */
 
 	if (ast_indications_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_indications_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_cdr_engine_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_cdr_engine_init\n%s", term_quit());
 		exit(1);
 	}
 
@@ -4508,47 +4629,47 @@ int main(int argc, char *argv[])
 	ast_udptl_init();
 
 	if (ast_image_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_image_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_file_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_file_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (load_pbx()) {
-		printf("%s", term_quit());
+		printf("Failed: load_pbx\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_local_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_local_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_cel_engine_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_cel_engine_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (init_manager()) {
-		printf("%s", term_quit());
+		printf("Failed: init_manager\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_enum_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_enum_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_cc_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_cc_init\n%s", term_quit());
 		exit(1);
 	}
 
 	if (ast_sounds_index_init()) {
-		printf("%s", term_quit());
+		printf("Failed: ast_sounds_index_init\n%s", term_quit());
 		exit(1);
 	}
 
@@ -4572,10 +4693,10 @@ int main(int argc, char *argv[])
 		sig_alert_pipe[0] = sig_alert_pipe[1] = -1;
 	}
 
+	ast_process_pending_reloads();
+
 	ast_set_flag(&ast_options, AST_OPT_FLAG_FULLY_BOOTED);
 	publish_fully_booted();
-
-	ast_process_pending_reloads();
 
 	pthread_sigmask(SIG_UNBLOCK, &sigs, NULL);
 
@@ -4586,16 +4707,23 @@ int main(int argc, char *argv[])
 	ast_lastreloadtime = ast_startuptime = ast_tvnow();
 	ast_cli_register_multiple(cli_asterisk_shutdown, ARRAY_LEN(cli_asterisk_shutdown));
 	ast_cli_register_multiple(cli_asterisk, ARRAY_LEN(cli_asterisk));
-	ast_register_atexit(main_atexit);
+	ast_register_cleanup(main_atexit);
 
 	run_startup_commands();
 
 	ast_verb(0, COLORIZE_FMT "\n", COLORIZE(COLOR_BRGREEN, 0, "Asterisk Ready."));
 
+	logger_queue_start();
+
 	if (ast_opt_console) {
 		/* Console stuff now... */
 		/* Register our quit function */
 		char title[256];
+		char hostname[MAXHOSTNAMELEN] = "";
+
+		if (gethostname(hostname, sizeof(hostname) - 1)) {
+			ast_copy_string(hostname, "<Unknown>", sizeof(hostname));
+		}
 
 		ast_pthread_create_detached(&mon_sig_flags, NULL, monitor_sig_flags, NULL);
 
@@ -4613,30 +4741,17 @@ int main(int argc, char *argv[])
 			buf = (char *) el_gets(el, &num);
 
 			if (!buf && write(1, "", 1) < 0)
-				goto lostterm;
+				return; /* quit */
 
 			if (buf) {
 				if (buf[strlen(buf)-1] == '\n')
 					buf[strlen(buf)-1] = '\0';
 
-				consolehandler((char *)buf);
-			} else if (ast_opt_remote && (write(STDOUT_FILENO, "\nUse EXIT or QUIT to exit the asterisk console\n",
-				   strlen("\nUse EXIT or QUIT to exit the asterisk console\n")) < 0)) {
-				/* Whoa, stdout disappeared from under us... Make /dev/null's */
-				int fd;
-				fd = open("/dev/null", O_RDWR);
-				if (fd > -1) {
-					dup2(fd, STDOUT_FILENO);
-					dup2(fd, STDIN_FILENO);
-				} else
-					ast_log(LOG_WARNING, "Failed to open /dev/null to recover from dead console. Bad things will happen!\n");
-				break;
+				consolehandler(buf);
 			}
 		}
 	}
 
+	/* Stall until a quit signal is given */
 	monitor_sig_flags(NULL);
-
-lostterm:
-	return 0;
 }

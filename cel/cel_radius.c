@@ -33,7 +33,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Rev: 419592 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Rev$")
 
 #ifdef FREERADIUS_CLIENT
 #include <freeradius-client.h>

@@ -27,7 +27,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419342 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <regex.h>
 
@@ -837,6 +837,10 @@ int aco_set_defaults(struct aco_type *type, const char *category, void *obj)
 	struct aco_option *opt;
 	struct ao2_iterator iter;
 
+	if (!type->internal) {
+		return -1;
+	}
+
 	iter = ao2_iterator_init(type->internal->opts, 0);
 
 	while ((opt = ao2_iterator_next(&iter))) {
@@ -1281,7 +1285,7 @@ static void aco_deinit(void)
 int aco_init(void)
 {
 #ifdef AST_XML_DOCS
-	ast_register_atexit(aco_deinit);
+	ast_register_cleanup(aco_deinit);
 	if (!(xmldocs = ast_xmldoc_build_documentation("configInfo"))) {
 		ast_log(LOG_ERROR, "Couldn't build config documentation\n");
 		return -1;

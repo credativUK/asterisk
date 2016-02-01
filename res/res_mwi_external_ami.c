@@ -127,7 +127,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419592 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/module.h"
 #include "asterisk/res_mwi_external.h"
@@ -226,12 +226,8 @@ static int mwi_mailbox_get(struct mansession *s, const struct message *m)
 	ao2_iterator_destroy(&iter);
 	ao2_ref(mailboxes, -1);
 
-	astman_append(s,
-		"Event: MWIGetComplete\r\n"
-		"EventList: Complete\r\n"
-		"ListItems: %u\r\n"
-		"%s"
-		"\r\n", count, id_text);
+	astman_send_list_complete_start(s, m, "MWIGetComplete", count);
+	astman_send_list_complete_end(s);
 
 	return 0;
 }
@@ -361,9 +357,9 @@ static int load_module(void)
 	ast_mwi_external_ref();
 
 	res = 0;
-	res |= ast_manager_register_xml_core("MWIGet", EVENT_FLAG_CALL | EVENT_FLAG_REPORTING, mwi_mailbox_get);
-	res |= ast_manager_register_xml_core("MWIDelete", EVENT_FLAG_CALL, mwi_mailbox_delete);
-	res |= ast_manager_register_xml_core("MWIUpdate", EVENT_FLAG_CALL, mwi_mailbox_update);
+	res |= ast_manager_register_xml("MWIGet", EVENT_FLAG_CALL | EVENT_FLAG_REPORTING, mwi_mailbox_get);
+	res |= ast_manager_register_xml("MWIDelete", EVENT_FLAG_CALL, mwi_mailbox_delete);
+	res |= ast_manager_register_xml("MWIUpdate", EVENT_FLAG_CALL, mwi_mailbox_update);
 	if (res) {
 		unload_module();
 		return AST_MODULE_LOAD_DECLINE;

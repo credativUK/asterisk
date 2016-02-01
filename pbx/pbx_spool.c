@@ -28,7 +28,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419044 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <sys/stat.h>
 #include <time.h>
@@ -102,6 +102,14 @@ struct outgoing {
 };
 
 #if defined(HAVE_INOTIFY) || defined(HAVE_KQUEUE)
+struct direntry {
+	AST_LIST_ENTRY(direntry) list;
+	time_t mtime;
+	char name[0];
+};
+
+static AST_LIST_HEAD_STATIC(dirlist, direntry);
+
 static void queue_file(const char *filename, time_t when);
 #endif
 
@@ -323,6 +331,10 @@ static int remove_from_queue(struct outgoing *o, const char *status)
 	char newfn[256];
 	const char *bname;
 
+#if defined(HAVE_INOTIFY) || defined(HAVE_KQUEUE)
+	struct direntry *cur;
+#endif
+
 	if (!ast_test_flag(&o->options, SPOOL_FLAG_ALWAYS_DELETE)) {
 		struct stat current_file_status;
 
@@ -332,6 +344,19 @@ static int remove_from_queue(struct outgoing *o, const char *status)
 			}
 		}
 	}
+
+#if defined(HAVE_INOTIFY) || defined(HAVE_KQUEUE)
+	AST_LIST_LOCK(&dirlist);
+	AST_LIST_TRAVERSE_SAFE_BEGIN(&dirlist, cur, list) {
+		if (!strcmp(cur->name, o->fn)) {
+			AST_LIST_REMOVE_CURRENT(list);
+			ast_free(cur);
+			break;
+		}
+	}
+	AST_LIST_TRAVERSE_SAFE_END;
+	AST_LIST_UNLOCK(&dirlist);
+#endif
 
 	if (!ast_test_flag(&o->options, SPOOL_FLAG_ARCHIVE)) {
 		unlink(o->fn);
@@ -377,14 +402,12 @@ static void *attempt_thread(void *data)
 		res = ast_pbx_outgoing_app(o->tech, o->capabilities, o->dest, o->waittime * 1000,
 			o->app, o->data, &reason, 2 /* wait to finish */, o->cid_num, o->cid_name,
 			o->vars, o->account, NULL, NULL);
-		o->vars = NULL;
 	} else {
 		ast_verb(3, "Attempting call on %s/%s for %s@%s:%d (Retry %d)\n", o->tech, o->dest, o->exten, o->context,o->priority, o->retries);
 		res = ast_pbx_outgoing_exten(o->tech, o->capabilities, o->dest,
 			o->waittime * 1000, o->context, o->exten, o->priority, &reason,
 			2 /* wait to finish */, o->cid_num, o->cid_name, o->vars, o->account, NULL,
 			ast_test_flag(&o->options, SPOOL_FLAG_EARLY_MEDIA), NULL);
-		o->vars = NULL;
 	}
 	if (res) {
 		ast_log(LOG_NOTICE, "Call failed to go through, reason (%d) %s\n", reason, ast_channel_reason2str(reason));
@@ -488,20 +511,14 @@ static int scan_service(const char *fn, time_t now)
 	return 0;
 }
 
-#if defined(HAVE_INOTIFY) || defined(HAVE_KQUEUE)
-struct direntry {
-	AST_LIST_ENTRY(direntry) list;
-	time_t mtime;
-	char name[0];
-};
-
-static AST_LIST_HEAD_STATIC(dirlist, direntry);
 
 #if defined(HAVE_INOTIFY)
 /* Only one thread is accessing this list, so no lock is necessary */
 static AST_LIST_HEAD_NOLOCK_STATIC(createlist, direntry);
 static AST_LIST_HEAD_NOLOCK_STATIC(openlist, direntry);
 #endif
+
+#if defined(HAVE_INOTIFY) || defined(HAVE_KQUEUE)
 
 static void queue_file(const char *filename, time_t when)
 {

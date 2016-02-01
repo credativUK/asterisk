@@ -146,7 +146,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419592 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <ctype.h>
 #include <sys/time.h>
@@ -1366,7 +1366,7 @@ static int sendmail(struct minivm_template *template, struct minivm_account *vmu
 	prep_email_sub_vars(ast, vmu, cidnum, cidname, dur, date, counter);
 
 	/* Find email address to use */
-	/* If there's a server e-mail adress in the account, user that, othterwise template */
+	/* If there's a server e-mail address in the account, use that, othterwise template */
 	fromemail = ast_strlen_zero(vmu->serveremail) ?  template->serveremail : vmu->serveremail;
 
 	/* Find name to user for server e-mail */
@@ -1838,7 +1838,8 @@ static int notify_new_message(struct ast_channel *chan, const char *templatename
 		etemplate = message_template_find(vmu->ptemplate);
 		if (!etemplate)
 			etemplate = message_template_find("pager-default");
-		if (etemplate->locale) {
+
+		if (!ast_strlen_zero(etemplate->locale)) {
 			ast_copy_string(oldlocale, setlocale(LC_TIME, ""), sizeof(oldlocale));
 			setlocale(LC_TIME, etemplate->locale);
 		}
@@ -1867,9 +1868,8 @@ static int notify_new_message(struct ast_channel *chan, const char *templatename
 
 notify_cleanup:
 	run_externnotify(chan, vmu);		/* Run external notification */
-
-	if (etemplate->locale) {
-		setlocale(LC_TIME, oldlocale); /* Rest to old locale */
+	if (!ast_strlen_zero(etemplate->locale)) {
+		setlocale(LC_TIME, oldlocale);	/* Reset to old locale */
 	}
 	return res;
 }

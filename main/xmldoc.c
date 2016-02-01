@@ -29,7 +29,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419822 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/_private.h"
 #include "asterisk/paths.h"
@@ -45,18 +45,9 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419822 $")
 /*! \brief Default documentation language. */
 static const char default_documentation_language[] = "en_US";
 
-/*!
- * \brief Number of columns to print when showing the XML documentation with a
- *         'core show application/function *' CLI command. Used in text wrapping.
- */
-static const int xmldoc_text_columns = 74;
-
-/*!
- * \brief This is a value that we will use to let the wrapping mechanism move the cursor
- *         backward and forward xmldoc_max_diff positions before cutting the middle of a
- *         word, trying to find a space or a \n.
- */
-static const int xmldoc_max_diff = 5;
+/*! \brief Number of columns to print when showing the XML documentation with a
+ *         'core show application/function *' CLI command. Used in text wrapping.*/
+static const int xmldoc_text_columns = 79;
 
 /*! \brief XML documentation language. */
 static char documentation_language[6];
@@ -176,100 +167,22 @@ static void xmldoc_setpostbr(char *postbr, size_t len, const char *text)
 
 /*!
  * \internal
- * \brief Try to find a space or a break in text starting at currentpost
- *         and moving at most maxdiff positions.
- *         Helper for xmldoc_string_wrap().
- *
- * \param text Input string where it will search.
- * \param currentpos Current position within text.
- * \param maxdiff Not move more than maxdiff inside text.
- *
- * \retval 1 if a space or break is found inside text while moving.
- * \retval 0 if no space or break is found.
- */
-static int xmldoc_wait_nextspace(const char *text, int currentpos, int maxdiff)
-{
-	int i, textlen;
-
-	if (!text) {
-		return 0;
-	}
-
-	textlen = strlen(text);
-	for (i = currentpos; i < textlen; i++) {
-		if (text[i] == ESC) {
-			/* Move to the end of the escape sequence */
-			while (i < textlen && text[i] != 'm') {
-				i++;
-			}
-		} else if (text[i] == ' ' || text[i] == '\n') {
-			/* Found the next space or linefeed */
-			return 1;
-		} else if (i - currentpos > maxdiff) {
-			/* We have looked the max distance and didn't find it */
-			return 0;
-		}
-	}
-
-	/* Reached the end and did not find it */
-
-	return 0;
-}
-
-/*!
- * \internal
- * \brief Helper function for xmldoc_string_wrap().
- *    Try to found a space or a break inside text moving backward
- *    not more than maxdiff positions.
- *
- * \param text The input string where to search for a space.
- * \param currentpos The current cursor position.
- * \param maxdiff The max number of positions to move within text.
- *
- * \retval 0 If no space is found (Notice that text[currentpos] is not a space or a break)
- * \retval > 0 If a space or a break is found, and the result is the position relative to
- *  currentpos.
- */
-static int xmldoc_foundspace_backward(const char *text, int currentpos, int maxdiff)
-{
-	int i;
-
-	for (i = currentpos; i > 0; i--) {
-		if (text[i] == ' ' || text[i] == '\n') {
-			return (currentpos - i);
-		} else if (text[i] == 'm' && (text[i - 1] >= '0' || text[i - 1] <= '9')) {
-			/* give up, we found the end of a possible ESC sequence. */
-			return 0;
-		} else if (currentpos - i > maxdiff) {
-			/* give up, we can't move anymore. */
-			return 0;
-		}
-	}
-
-	/* we found the beginning of the text */
-
-	return 0;
-}
-
-/*!
- * \internal
  * \brief Justify a text to a number of columns.
  *
  * \param text Input text to be justified.
  * \param columns Number of columns to preserve in the text.
- * \param maxdiff Try to not cut a word when goinf down.
  *
  * \retval NULL on error.
  * \retval The wrapped text.
  */
-static char *xmldoc_string_wrap(const char *text, int columns, int maxdiff)
+static char *xmldoc_string_wrap(const char *text, int columns)
 {
 	struct ast_str *tmp;
 	char *ret, postbr[160];
-	int count = 1, i, backspace, needtobreak = 0, colmax, textlen;
+	int count, i, textlen, postbrlen, lastbreak;
 
 	/* sanity check */
-	if (!text || columns <= 0 || maxdiff < 0) {
+	if (!text || columns <= 0) {
 		ast_log(LOG_WARNING, "Passing wrong arguments while trying to wrap the text\n");
 		return NULL;
 	}
@@ -282,55 +195,44 @@ static char *xmldoc_string_wrap(const char *text, int columns, int maxdiff)
 
 	/* Check for blanks and tabs and put them in postbr. */
 	xmldoc_setpostbr(postbr, sizeof(postbr), text);
-	colmax = columns - xmldoc_postbrlen(postbr);
+	postbrlen = xmldoc_postbrlen(postbr);
+
+	count = 0;
+	lastbreak = 0;
 
 	textlen = strlen(text);
 	for (i = 0; i < textlen; i++) {
-		if (needtobreak || !(count % colmax)) {
-			if (text[i] == ' ') {
-				ast_str_append(&tmp, 0, "\n%s", postbr);
-				needtobreak = 0;
-				count = 1;
-			} else if (text[i] != '\n') {
-				needtobreak = 1;
-				if (xmldoc_wait_nextspace(text, i, maxdiff)) {
-					/* wait for the next space */
-					ast_str_append(&tmp, 0, "%c", text[i]);
-					continue;
-				}
-				/* Try to look backwards */
-				backspace = xmldoc_foundspace_backward(text, i, maxdiff);
-				if (backspace) {
-					needtobreak = 1;
-					ast_str_truncate(tmp, -backspace);
-					i -= backspace + 1;
-					continue;
-				}
-				ast_str_append(&tmp, 0, "\n%s", postbr);
-				needtobreak = 0;
-				count = 1;
-			}
-			/* skip blanks after a \n */
-			while (text[i] == ' ') {
-				i++;
-			}
-		}
 		if (text[i] == '\n') {
 			xmldoc_setpostbr(postbr, sizeof(postbr), &text[i] + 1);
-			colmax = columns - xmldoc_postbrlen(postbr);
-			needtobreak = 0;
-			count = 1;
-		}
-		if (text[i] == ESC) {
-			/* Ignore Escape sequences. */
+			postbrlen = xmldoc_postbrlen(postbr);
+			count = 0;
+			lastbreak = 0;
+		} else if (text[i] == ESC) {
+			/* Walk over escape sequences without counting them. */
 			do {
 				ast_str_append(&tmp, 0, "%c", text[i]);
 				i++;
 			} while (i < textlen && text[i] != 'm');
 		} else {
+			if (text[i] == ' ') {
+				lastbreak = i;
+			}
 			count++;
 		}
-		ast_str_append(&tmp, 0, "%c", text[i]);
+
+		if (count > columns) {
+			/* Seek backwards if it was at most 30 characters ago. */
+			int back = i - lastbreak;
+			if (lastbreak && back > 0 && back < 30) {
+				ast_str_truncate(tmp, -back);
+				i = lastbreak; /* go back a bit */
+			}
+			ast_str_append(&tmp, 0, "\n%s", postbr);
+			count = postbrlen;
+			lastbreak = 0;
+		} else {
+			ast_str_append(&tmp, 0, "%c", text[i]);
+		}
 	}
 
 	ret = ast_strdup(ast_str_buffer(tmp));
@@ -442,7 +344,7 @@ char *ast_xmldoc_printable(const char *bwinput, int withcolors)
 	}
 
 	/* Wrap the text, notice that string wrap will avoid cutting an ESC sequence. */
-	wrapped = xmldoc_string_wrap(ast_str_buffer(colorized), xmldoc_text_columns, xmldoc_max_diff);
+	wrapped = xmldoc_string_wrap(ast_str_buffer(colorized), xmldoc_text_columns);
 
 	ast_free(colorized);
 
@@ -1239,7 +1141,7 @@ static char *xmldoc_get_syntax_config_option(struct ast_xml_node *fixnode, const
 	regex = ast_xml_get_attribute(fixnode, "regex");
 	ast_str_set(&syntax, 0, "%s = [%s] (Default: %s) (Regex: %s)\n",
 		name,
-		type,
+		type ?: "",
 		default_value ?: "n/a",
 		regex ?: "False");
 
@@ -2214,6 +2116,9 @@ static struct ast_str *xmldoc_get_formatted(struct ast_xml_node *node, int raw_o
 		ast_xml_free_text(tmpstr);
 	} else {
 		ret = ast_str_create(128);
+		if (!ret) {
+			return NULL;
+		}
 		for (tmp = ast_xml_node_get_children(node); tmp; tmp = ast_xml_node_get_next(tmp)) {
 			/* if found, parse children elements. */
 			if (xmldoc_parse_common_elements(tmp, "", "\n", &ret)) {
@@ -2263,7 +2168,7 @@ static char *_xmldoc_build_field(struct ast_xml_node *node, const char *var, int
 	}
 
 	formatted = xmldoc_get_formatted(node, raw, raw);
-	if (ast_str_strlen(formatted) > 0) {
+	if (formatted && ast_str_strlen(formatted) > 0) {
 		ret = ast_strdup(ast_str_buffer(formatted));
 	}
 	ast_free(formatted);
@@ -2533,7 +2438,8 @@ static struct ast_xml_doc_item *xmldoc_build_list_responses(struct ast_xml_node 
 	/* Iterate over managerEvent nodes */
 	for (event = ast_xml_node_get_children(list_elements); event; event = ast_xml_node_get_next(event)) {
 		struct ast_xml_node *event_instance;
-		const char *name = ast_xml_get_attribute(event, "name");
+		RAII_VAR(const char *, name, ast_xml_get_attribute(event, "name"),
+			ast_xml_free_attr);
 		struct ast_xml_doc_item *new_item;
 
 		if (!name || strcmp(ast_xml_node_get_name(event), "managerEvent")) {
@@ -2607,10 +2513,16 @@ static struct ast_xml_doc_item *xmldoc_build_final_response(struct ast_xml_node 
 		"managerEventInstance", NULL, NULL);
 	if (!event_instance) {
 		return NULL;
+	} else {
+		const char *name;
+		struct ast_xml_doc_item *res;
+
+		name = ast_xml_get_attribute(final_response_event, "name");
+		res = xmldoc_build_documentation_item(event_instance, name, "managerEvent");
+		ast_xml_free_attr(name);
+		return res;
 	}
 
-	return xmldoc_build_documentation_item(event_instance,
-		ast_xml_get_attribute(final_response_event, "name"), "managerEvent");
 }
 
 struct ast_xml_doc_item *ast_xmldoc_build_final_response(const char *type, const char *name, const char *module)
@@ -2636,14 +2548,18 @@ struct ast_xml_xpath_results *__attribute__((format(printf, 1, 2))) ast_xmldoc_q
 	struct documentation_tree *doctree;
 	RAII_VAR(struct ast_str *, xpath_str, ast_str_create(128), ast_free);
 	va_list ap;
+	int res;
 
 	if (!xpath_str) {
 		return NULL;
 	}
 
 	va_start(ap, fmt);
-	ast_str_set_va(&xpath_str, 0, fmt, ap);
+	res = ast_str_set_va(&xpath_str, 0, fmt, ap);
 	va_end(ap);
+	if (res == AST_DYNSTR_BUILD_FAILED) {
+		return NULL;
+	}
 
 	AST_RWLIST_RDLOCK(&xmldoc_tree);
 	AST_LIST_TRAVERSE(&xmldoc_tree, doctree, entry) {
@@ -2952,7 +2868,7 @@ int ast_xmldoc_load_documentation(void)
 
 	ast_cli_register(&cli_dump_xmldocs);
 	/* register function to be run when asterisk finish. */
-	ast_register_atexit(xmldoc_unload_documentation);
+	ast_register_cleanup(xmldoc_unload_documentation);
 
 	globbuf.gl_offs = 0;    /* slots to reserve in gl_pathv */
 
@@ -2969,7 +2885,7 @@ int ast_xmldoc_load_documentation(void)
 	globret = glob(xmlpattern, MY_GLOB_FLAGS, NULL, &globbuf);
 #endif
 
-	ast_debug(3, "gl_pathc %zu\n", globbuf.gl_pathc);
+	ast_debug(3, "gl_pathc %zu\n", (size_t)globbuf.gl_pathc);
 	if (globret == GLOB_NOSPACE) {
 		ast_log(LOG_WARNING, "XML load failure, glob expansion of pattern '%s' failed: Not enough memory\n", xmlpattern);
 		ast_free(xmlpattern);

@@ -982,7 +982,113 @@ ALTER TABLE ps_endpoints ADD CONSTRAINT yesno_values CHECK (media_encryption_opt
 
 GO
 
-INSERT INTO alembic_version (version_num) VALUES ('eb88a14f2a');
+-- Running upgrade eb88a14f2a -> 371a3bf4143e
+
+ALTER TABLE ps_endpoints ADD user_eq_phone VARCHAR(3) NULL;
+
+GO
+
+ALTER TABLE ps_endpoints ADD CONSTRAINT yesno_values CHECK (user_eq_phone IN ('yes', 'no'));
+
+GO
+
+-- Running upgrade 371a3bf4143e -> 45e3f47c6c44
+
+ALTER TABLE ps_globals ADD endpoint_identifier_order VARCHAR(40) NULL;
+
+GO
+
+-- Running upgrade 45e3f47c6c44 -> 23530d604b96
+
+ALTER TABLE ps_endpoints ADD rpid_immediate VARCHAR(3) NULL;
+
+GO
+
+ALTER TABLE ps_endpoints ADD CONSTRAINT yesno_values CHECK (rpid_immediate IN ('yes', 'no'));
+
+GO
+
+-- Running upgrade 23530d604b96 -> 31cd4f4891ec
+
+ALTER TABLE ps_endpoints DROP CONSTRAINT pjsip_dtmf_mode_values;
+
+GO
+
+ALTER TABLE ps_endpoints ALTER COLUMN dtmf_mode VARCHAR(7);
+
+GO
+
+ALTER TABLE ps_endpoints ADD CONSTRAINT pjsip_dtmf_mode_values_v2 CHECK (dtmf_mode IN ('rfc4733', 'inband', 'info', 'auto'));
+
+GO
+
+-- Running upgrade 31cd4f4891ec -> 461d7d691209
+
+ALTER TABLE ps_aors ADD qualify_timeout INTEGER NULL;
+
+GO
+
+ALTER TABLE ps_contacts ADD qualify_timeout INTEGER NULL;
+
+GO
+
+-- Running upgrade 461d7d691209 -> a541e0b5e89
+
+ALTER TABLE ps_globals ADD max_initial_qualify_time INTEGER NULL;
+
+GO
+
+-- Running upgrade a541e0b5e89 -> 28b8e71e541f
+
+ALTER TABLE ps_endpoints ADD g726_non_standard VARCHAR(3) NULL;
+
+GO
+
+ALTER TABLE ps_endpoints ADD CONSTRAINT yesno_values CHECK (g726_non_standard IN ('yes', 'no'));
+
+GO
+
+-- Running upgrade 28b8e71e541f -> 498357a710ae
+
+ALTER TABLE ps_endpoints ADD rtp_keepalive INTEGER NULL;
+
+GO
+
+-- Running upgrade 498357a710ae -> 26f10cadc157
+
+ALTER TABLE ps_endpoints ADD rtp_timeout INTEGER NULL;
+
+GO
+
+ALTER TABLE ps_endpoints ADD rtp_timeout_hold INTEGER NULL;
+
+GO
+
+-- Running upgrade 26f10cadc157 -> 154177371065
+
+ALTER TABLE ps_globals ADD default_from_user VARCHAR(80) NULL;
+
+GO
+
+-- Running upgrade 154177371065 -> 28ce1e718f05
+
+ALTER TABLE ps_registrations ADD fatal_retry_interval INTEGER NULL;
+
+GO
+
+-- Running upgrade 28ce1e718f05 -> 189a235b3fd7
+
+ALTER TABLE ps_globals ADD keep_alive_interval INTEGER NULL;
+
+GO
+
+-- Running upgrade 189a235b3fd7 -> 2d078ec071b7
+
+ALTER TABLE ps_aors ALTER COLUMN contact VARCHAR(255);
+
+GO
+
+INSERT INTO alembic_version (version_num) VALUES ('2d078ec071b7');
 
 GO
 

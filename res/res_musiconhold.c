@@ -39,7 +39,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 422037 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <ctype.h>
 #include <signal.h>
@@ -881,7 +881,7 @@ static struct mohclass *_get_mohbyname(const char *name, int warn, int flags, co
 #endif
 
 	if (!moh && warn) {
-		ast_debug(1, "Music on Hold class '%s' not found in memory\n", name);
+		ast_log(LOG_WARNING, "Music on Hold class '%s' not found in memory. Verify your configuration.\n", name);
 	}
 
 	return moh;

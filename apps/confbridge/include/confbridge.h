@@ -34,6 +34,8 @@
 #define MAX_CONF_NAME AST_MAX_EXTENSION
 /* Maximum length of a conference pin */
 #define MAX_PIN     80
+/* Maximum length of bridge/user/menu profile names */
+#define MAX_PROFILE_NAME 128
 
 #define DEFAULT_USER_PROFILE "default_user"
 #define DEFAULT_BRIDGE_PROFILE "default_bridge"
@@ -123,12 +125,12 @@ struct conf_menu_entry {
  * of DTMF sequences coupled with the actions those
  * sequences invoke.*/
 struct conf_menu {
-	char name[128];
+	char name[MAX_PROFILE_NAME];
 	AST_LIST_HEAD_NOLOCK(, conf_menu_entry) entries;
 };
 
 struct user_profile {
-	char name[128];
+	char name[MAX_PROFILE_NAME];
 	char pin[MAX_PIN];
 	char moh_class[128];
 	char announcement[PATH_MAX];
@@ -138,6 +140,8 @@ struct user_profile {
 	unsigned int talking_threshold;
 	/*! The time in ms of silence before a user is considered to be silent by the dsp. */
 	unsigned int silence_threshold;
+	/*! The time in ms the user may stay in the confbridge */
+	unsigned int timeout;
 };
 
 enum conf_sounds {
@@ -195,7 +199,7 @@ struct bridge_profile_sounds {
 };
 
 struct bridge_profile {
-	char name[64];
+	char name[MAX_PROFILE_NAME];
 	char language[MAX_LANGUAGE];		  /*!< Language used for playback_chan */
 	char rec_file[PATH_MAX];
 	unsigned int flags;
@@ -216,13 +220,11 @@ struct confbridge_conference {
 	unsigned int waitingusers;                                        /*!< Number of waiting users present */
 	unsigned int locked:1;                                            /*!< Is this conference bridge locked? */
 	unsigned int muted:1;                                             /*!< Is this conference bridge muted? */
-	unsigned int record_state:2;                                      /*!< Whether recording is started, stopped, or should exit */
 	struct ast_channel *playback_chan;                                /*!< Channel used for playback into the conference bridge */
 	struct ast_channel *record_chan;                                  /*!< Channel used for recording the conference */
-	pthread_t record_thread;                                          /*!< The thread the recording chan lives in */
+	struct ast_str *record_filename;                                  /*!< Recording filename. */
+	struct ast_str *orig_rec_file;                                    /*!< Previous b_profile.rec_file. */
 	ast_mutex_t playback_lock;                                        /*!< Lock used for playback channel */
-	ast_mutex_t record_lock;                                          /*!< Lock used for the record thread */
-	ast_cond_t record_cond;                                           /*!< Recording condition variable */
 	AST_LIST_HEAD_NOLOCK(, confbridge_user) active_list;              /*!< List of users participating in the conference bridge */
 	AST_LIST_HEAD_NOLOCK(, confbridge_user) waiting_list;             /*!< List of users waiting to join the conference bridge */
 };
@@ -239,7 +241,7 @@ struct confbridge_user {
 	struct confbridge_conference *conference;    /*!< Conference bridge they are participating in */
 	struct bridge_profile b_profile;             /*!< The Bridge Configuration Profile */
 	struct user_profile u_profile;               /*!< The User Configuration Profile */
-	char menu_name[64];                          /*!< The name of the DTMF menu assigned to this user */
+	char menu_name[MAX_PROFILE_NAME];            /*!< The name of the DTMF menu assigned to this user */
 	char name_rec_location[PATH_MAX];            /*!< Location of the User's name recorded file if it exists */
 	struct ast_channel *chan;                    /*!< Asterisk channel participating */
 	struct ast_bridge_features features;         /*!< Bridge features structure */

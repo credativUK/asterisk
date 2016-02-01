@@ -310,6 +310,60 @@ char *ast_unescape_semicolon(char *s);
 char *ast_unescape_c(char *s);
 
 /*!
+ * \brief Escape the 'to_escape' characters in the given string.
+ *
+ * \note The given output buffer will contain a truncated escaped
+ * version of the source string if the given buffer is not large
+ * enough.
+ *
+ * \param dest the escaped string
+ * \param s the source string to escape
+ * \param size The size of the destination buffer
+ * \param to_escape an array of characters to escape
+ *
+ * \return Pointer to the destination.
+ */
+char *ast_escape(char *dest, const char *s, size_t size, const char *to_escape);
+
+/*!
+ * \brief Escape standard 'C' sequences in the given string.
+ *
+ * \note The given output buffer will contain a truncated escaped
+ * version of the source string if the given buffer is not large
+ * enough.
+ *
+ * \param dest the escaped string
+ * \param s the source string to escape
+ * \param size The size of the destination buffer
+ *
+ * \return Pointer to the escaped string.
+ */
+char *ast_escape_c(char *dest, const char *s, size_t size);
+
+/*!
+ * \brief Escape the 'to_escape' characters in the given string.
+ *
+ * \note Caller is responsible for freeing the returned string
+ *
+ * \param s the source string to escape
+ * \param to_escape an array of characters to escape
+ *
+ * \return Pointer to the escaped string or NULL.
+ */
+char *ast_escape_alloc(const char *s, const char *to_escape);
+
+/*!
+ * \brief Escape standard 'C' sequences in the given string.
+ *
+ * \note Caller is responsible for freeing the returned string
+ *
+ * \param s the source string to escape
+ *
+ * \return Pointer to the escaped string or NULL.
+ */
+char *ast_escape_c_alloc(const char *s);
+
+/*!
   \brief Size-limited null-terminating string copy.
   \param dst The destination buffer.
   \param src The source string
@@ -1233,7 +1287,8 @@ static force_inline char *attribute_pure ast_str_to_upper(char *str)
  * \retval AO2 container for strings
  * \retval NULL if allocation failed
  */
-struct ao2_container *ast_str_container_alloc_options(enum ao2_container_opts opts, int buckets);
+//struct ao2_container *ast_str_container_alloc_options(enum ao2_container_opts opts, int buckets);
+struct ao2_container *ast_str_container_alloc_options(enum ao2_alloc_opts opts, int buckets);
 
 /*!
  * \since 12

@@ -25,7 +25,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 421880 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/stasis_channels.h"
 
@@ -428,6 +428,38 @@ int stasis_app_control_continue(struct stasis_app_control *control, const char *
 	return 0;
 }
 
+static int app_control_redirect(struct stasis_app_control *control,
+	struct ast_channel *chan, void *data)
+{
+	char *endpoint = data;
+	int res;
+
+	ast_assert(control->channel != NULL);
+	ast_assert(endpoint != NULL);
+
+	res = ast_transfer(control->channel, endpoint);
+	if (!res) {
+		ast_log(LOG_NOTICE, "Unsupported transfer requested on channel '%s'\n",
+			ast_channel_name(control->channel));
+		return 0;
+	}
+
+	return 0;
+}
+
+int stasis_app_control_redirect(struct stasis_app_control *control, const char *endpoint)
+{
+	char *endpoint_data = ast_strdup(endpoint);
+
+	if (!endpoint_data) {
+		return -1;
+	}
+
+	stasis_app_send_command_async(control, app_control_redirect, endpoint_data, ast_free_ptr);
+
+	return 0;
+}
+
 struct stasis_app_control_dtmf_data {
 	int before;
 	int between;
@@ -713,7 +745,7 @@ static int app_send_command_on_condition(struct stasis_app_control *control,
 {
 	RAII_VAR(struct stasis_app_command *, command, NULL, ao2_cleanup);
 
-	if (control == NULL) {
+	if (control == NULL || control->is_done) {
 		return -1;
 	}
 
@@ -738,7 +770,7 @@ int stasis_app_send_command_async(struct stasis_app_control *control,
 {
 	RAII_VAR(struct stasis_app_command *, command, NULL, ao2_cleanup);
 
-	if (control == NULL) {
+	if (control == NULL || control->is_done) {
 		return -1;
 	}
 

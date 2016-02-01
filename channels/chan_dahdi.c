@@ -54,7 +54,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 428687 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #if defined(__NetBSD__) || defined(__FreeBSD__)
 #include <pthread.h>
@@ -600,14 +600,6 @@ static int restart_monitor(void);
 
 static int dahdi_sendtext(struct ast_channel *c, const char *text);
 
-static void mwi_event_cb(void *userdata, struct stasis_subscription *sub, struct stasis_message *msg)
-{
-	/* This module does not handle MWI in an event-based manner.  However, it
-	 * subscribes to MWI for each mailbox that is configured so that the core
-	 * knows that we care about it.  Then, chan_dahdi will get the MWI from the
-	 * event cache instead of checking the mailbox directly. */
-}
-
 /*! \brief Avoid the silly dahdi_getevent which ignores a bunch of events */
 static inline int dahdi_get_event(int fd)
 {
@@ -919,6 +911,7 @@ static struct dahdi_chan_conf dahdi_chan_conf_default(void)
 			.privateprefix = "",
 			.unknownprefix = "",
 			.colp_send = SIG_PRI_COLP_UPDATE,
+			.force_restart_unavailable_chans = 1,
 			.resetinterval = -1,
 		},
 #endif
@@ -1301,13 +1294,21 @@ static int my_start_cid_detect(void *pvt, int cid_signalling)
 	return 0;
 }
 
+static int restore_gains(struct dahdi_pvt *p);
+
 static int my_stop_cid_detect(void *pvt)
 {
 	struct dahdi_pvt *p = pvt;
 	int index = SUB_REAL;
-	if (p->cs)
+
+	if (p->cs) {
 		callerid_free(p->cs);
+	}
+
+	/* Restore linear mode after Caller*ID processing */
 	dahdi_setlinear(p->subs[index].dfd, p->subs[index].linear);
+	restore_gains(p);
+
 	return 0;
 }
 
@@ -1383,7 +1384,6 @@ static int my_get_callerid(void *pvt, char *namebuf, char *numbuf, enum analog_e
 }
 
 static const char *event2str(int event);
-static int restore_gains(struct dahdi_pvt *p);
 
 static int my_distinctive_ring(struct ast_channel *chan, void *pvt, int idx, int *ringdata)
 {
@@ -1396,7 +1396,7 @@ static int my_distinctive_ring(struct ast_channel *chan, void *pvt, int idx, int
 	int i;
 	int res;
 	int checkaftercid = 0;
-
+	const char *matched_context;
 	struct dahdi_pvt *p = pvt;
 	struct analog_pvt *analog_p = p->sig_pvt;
 
@@ -1406,46 +1406,44 @@ static int my_distinctive_ring(struct ast_channel *chan, void *pvt, int idx, int
 		checkaftercid = 1;
 	}
 
-	/* We must have a ring by now, so, if configured, lets try to listen for
-	 * distinctive ringing */
+	/* We must have a ring by now so lets try to listen for distinctive ringing */
 	if ((checkaftercid && distinctiveringaftercid) || !checkaftercid) {
 		/* Clear the current ring data array so we don't have old data in it. */
 		for (receivedRingT = 0; receivedRingT < RING_PATTERNS; receivedRingT++)
 			ringdata[receivedRingT] = 0;
 		receivedRingT = 0;
-		if (checkaftercid && distinctiveringaftercid)
+
+		if (checkaftercid && distinctiveringaftercid) {
 			ast_verb(3, "Detecting post-CID distinctive ring\n");
-		/* Check to see if context is what it should be, if not set to be. */
-		else if (strcmp(p->context,p->defcontext) != 0) {
-			ast_copy_string(p->context, p->defcontext, sizeof(p->context));
-			ast_channel_context_set(chan, p->defcontext);
 		}
 
 		for (;;) {
 			i = DAHDI_IOMUX_READ | DAHDI_IOMUX_SIGEVENT;
-			if ((res = ioctl(p->subs[idx].dfd, DAHDI_IOMUX, &i))) {
+			res = ioctl(p->subs[idx].dfd, DAHDI_IOMUX, &i);
+			if (res) {
 				ast_log(LOG_WARNING, "I/O MUX failed: %s\n", strerror(errno));
 				ast_hangup(chan);
 				return 1;
 			}
 			if (i & DAHDI_IOMUX_SIGEVENT) {
 				res = dahdi_get_event(p->subs[idx].dfd);
+				ast_debug(3, "Got event %d (%s)...\n", res, event2str(res));
 				if (res == DAHDI_EVENT_NOALARM) {
 					p->inalarm = 0;
 					analog_p->inalarm = 0;
+				} else if (res == DAHDI_EVENT_RINGOFFHOOK) {
+					/* Let us detect distinctive ring */
+					ringdata[receivedRingT] = analog_p->ringt;
+
+					if (analog_p->ringt < analog_p->ringt_base / 2) {
+						break;
+					}
+					/* Increment the ringT counter so we can match it against
+					   values in chan_dahdi.conf for distinctive ring */
+					if (++receivedRingT == RING_PATTERNS) {
+						break;
+					}
 				}
-				ast_log(LOG_NOTICE, "Got event %d (%s)...\n", res, event2str(res));
-				res = 0;
-				/* Let us detect distinctive ring */
-
-				ringdata[receivedRingT] = analog_p->ringt;
-
-				if (analog_p->ringt < analog_p->ringt_base/2)
-					break;
-				/* Increment the ringT counter so we can match it against
-				   values in chan_dahdi.conf for distinctive ring */
-				if (++receivedRingT == RING_PATTERNS)
-					break;
 			} else if (i & DAHDI_IOMUX_READ) {
 				res = read(p->subs[idx].dfd, buf, sizeof(buf));
 				if (res < 0) {
@@ -1458,51 +1456,55 @@ static int my_distinctive_ring(struct ast_channel *chan, void *pvt, int idx, int
 				}
 				if (analog_p->ringt > 0) {
 					if (!(--analog_p->ringt)) {
-						res = -1;
 						break;
 					}
 				}
 			}
 		}
 	}
-	if ((checkaftercid && usedistinctiveringdetection) || !checkaftercid) {
-		/* this only shows up if you have n of the dring patterns filled in */
-		ast_verb(3, "Detected ring pattern: %d,%d,%d\n",ringdata[0],ringdata[1],ringdata[2]);
-		for (counter = 0; counter < 3; counter++) {
-		/* Check to see if the rings we received match any of the ones in chan_dahdi.conf for this channel */
-			distMatches = 0;
-			/* this only shows up if you have n of the dring patterns filled in */
-			ast_verb(3, "Checking %d,%d,%d\n",
-					p->drings.ringnum[counter].ring[0],
-					p->drings.ringnum[counter].ring[1],
-					p->drings.ringnum[counter].ring[2]);
-			for (counter1 = 0; counter1 < 3; counter1++) {
-				ast_verb(3, "Ring pattern check range: %d\n", p->drings.ringnum[counter].range);
-				if (p->drings.ringnum[counter].ring[counter1] == -1) {
-					ast_verb(3, "Pattern ignore (-1) detected, so matching pattern %d regardless.\n",
-					ringdata[counter1]);
-					distMatches++;
-				} else if (ringdata[counter1] <= (p->drings.ringnum[counter].ring[counter1] + p->drings.ringnum[counter].range) &&
-										ringdata[counter1] >= (p->drings.ringnum[counter].ring[counter1] - p->drings.ringnum[counter].range)) {
-					ast_verb(3, "Ring pattern matched in range: %d to %d\n",
-					(p->drings.ringnum[counter].ring[counter1] - p->drings.ringnum[counter].range),
-					(p->drings.ringnum[counter].ring[counter1] + p->drings.ringnum[counter].range));
-					distMatches++;
-				}
-			}
 
-			if (distMatches == 3) {
-				/* The ring matches, set the context to whatever is for distinctive ring.. */
-				ast_copy_string(p->context, S_OR(p->drings.ringContext[counter].contextData, p->defcontext), sizeof(p->context));
-				ast_channel_context_set(chan, S_OR(p->drings.ringContext[counter].contextData, p->defcontext));
-				ast_verb(3, "Distinctive Ring matched context %s\n",p->context);
+	/* Check to see if the rings we received match any of the ones in chan_dahdi.conf for this channel */
+	ast_verb(3, "Detected ring pattern: %d,%d,%d\n", ringdata[0], ringdata[1], ringdata[2]);
+	matched_context = p->defcontext;
+	for (counter = 0; counter < 3; counter++) {
+		int range = p->drings.ringnum[counter].range;
+
+		distMatches = 0;
+		ast_verb(3, "Checking %d,%d,%d with +/- %d range\n",
+			p->drings.ringnum[counter].ring[0],
+			p->drings.ringnum[counter].ring[1],
+			p->drings.ringnum[counter].ring[2],
+			range);
+		for (counter1 = 0; counter1 < 3; counter1++) {
+			int ring = p->drings.ringnum[counter].ring[counter1];
+
+			if (ring == -1) {
+				ast_verb(3, "Pattern ignore (-1) detected, so matching pattern %d regardless.\n",
+					ringdata[counter1]);
+				distMatches++;
+			} else if (ring - range <= ringdata[counter1] && ringdata[counter1] <= ring + range) {
+				ast_verb(3, "Ring pattern %d is in range: %d to %d\n",
+					ringdata[counter1], ring - range, ring + range);
+				distMatches++;
+			} else {
+				/* The current dring pattern cannot match. */
 				break;
 			}
 		}
+
+		if (distMatches == 3) {
+			/* The ring matches, set the context to whatever is for distinctive ring.. */
+			matched_context = S_OR(p->drings.ringContext[counter].contextData, p->defcontext);
+			ast_verb(3, "Matched Distinctive Ring context %s\n", matched_context);
+			break;
+		}
 	}
-	/* Restore linear mode (if appropriate) for Caller*ID processing */
-	dahdi_setlinear(p->subs[idx].dfd, p->subs[idx].linear);
-	restore_gains(p);
+
+	/* Set selected distinctive ring context if not already set. */
+	if (strcmp(p->context, matched_context) != 0) {
+		ast_copy_string(p->context, matched_context, sizeof(p->context));
+		ast_channel_context_set(chan, matched_context);
+	}
 
 	return 0;
 }
@@ -4197,7 +4199,7 @@ static int dahdi_digit_begin(struct ast_channel *chan, char digit)
 {
 	struct dahdi_pvt *pvt;
 	int idx;
-	int dtmf = -1;
+	int dtmf;
 	int res;
 
 	pvt = ast_channel_tech_pvt(chan);
@@ -4220,8 +4222,11 @@ static int dahdi_digit_begin(struct ast_channel *chan, char digit)
 		break;
 	}
 #endif
-	if ((dtmf = digit_to_dtmfindex(digit)) == -1)
+	dtmf = digit_to_dtmfindex(digit);
+	if (dtmf == -1) {
+		/* Not a valid DTMF digit */
 		goto out;
+	}
 
 	if (pvt->pulse || ioctl(pvt->subs[SUB_REAL].dfd, DAHDI_SENDTONE, &dtmf)) {
 		char dial_str[] = { 'T', digit, '\0' };
@@ -4231,10 +4236,19 @@ static int dahdi_digit_begin(struct ast_channel *chan, char digit)
 			pvt->dialing = 1;
 		}
 	} else {
-		ast_debug(1, "Channel %s started VLDTMF digit '%c'\n",
-			ast_channel_name(chan), digit);
 		pvt->dialing = 1;
 		pvt->begindigit = digit;
+
+		/* Flush the write buffer in DAHDI to start sending the digit immediately. */
+		dtmf = DAHDI_FLUSH_WRITE;
+		res = ioctl(pvt->subs[SUB_REAL].dfd, DAHDI_FLUSH, &dtmf);
+		if (res) {
+			ast_log(LOG_WARNING, "Unable to flush the DAHDI write buffer to send DTMF on channel %d: %s\n",
+				pvt->channel, strerror(errno));
+		}
+
+		ast_debug(1, "Channel %s started VLDTMF digit '%c'\n",
+			ast_channel_name(chan), digit);
 	}
 
 out:
@@ -8771,37 +8785,52 @@ static int my_dahdi_write(struct dahdi_pvt *p, unsigned char *buf, int len, int 
 
 static int dahdi_write(struct ast_channel *ast, struct ast_frame *frame)
 {
-	struct dahdi_pvt *p = ast_channel_tech_pvt(ast);
+	struct dahdi_pvt *p;
 	int res;
 	int idx;
+
+	/* Write a frame of (presumably voice) data */
+	if (frame->frametype != AST_FRAME_VOICE) {
+		if (frame->frametype != AST_FRAME_IMAGE) {
+			ast_log(LOG_WARNING, "Don't know what to do with frame type '%u'\n",
+				frame->frametype);
+		}
+		return 0;
+	}
+
+	/* Return if it's not valid data */
+	if (!frame->data.ptr || !frame->datalen) {
+		return 0;
+	}
+
+	p = ast_channel_tech_pvt(ast);
+	ast_mutex_lock(&p->lock);
+
 	idx = dahdi_get_index(ast, p, 0);
 	if (idx < 0) {
+		ast_mutex_unlock(&p->lock);
 		ast_log(LOG_WARNING, "%s doesn't really exist?\n", ast_channel_name(ast));
 		return -1;
 	}
 
-	/* Write a frame of (presumably voice) data */
-	if (frame->frametype != AST_FRAME_VOICE) {
-		if (frame->frametype != AST_FRAME_IMAGE)
-			ast_log(LOG_WARNING, "Don't know what to do with frame type '%u'\n", frame->frametype);
-		return 0;
-	}
 	if (p->dialing) {
-		ast_debug(5, "Dropping frame since I'm still dialing on %s...\n",ast_channel_name(ast));
+		ast_mutex_unlock(&p->lock);
+		ast_debug(5, "Dropping frame since I'm still dialing on %s...\n",
+			ast_channel_name(ast));
 		return 0;
 	}
 	if (!p->owner) {
-		ast_debug(5, "Dropping frame since there is no active owner on %s...\n",ast_channel_name(ast));
+		ast_mutex_unlock(&p->lock);
+		ast_debug(5, "Dropping frame since there is no active owner on %s...\n",
+			ast_channel_name(ast));
 		return 0;
 	}
 	if (p->cidspill) {
+		ast_mutex_unlock(&p->lock);
 		ast_debug(5, "Dropping frame since I've still got a callerid spill on %s...\n",
 			ast_channel_name(ast));
 		return 0;
 	}
-	/* Return if it's not valid data */
-	if (!frame->data.ptr || !frame->datalen)
-		return 0;
 
 	if (ast_format_cmp(frame->subclass.format, ast_format_slin) == AST_FORMAT_CMP_EQUAL) {
 		if (!p->subs[idx].linear) {
@@ -8822,10 +8851,12 @@ static int dahdi_write(struct ast_channel *ast, struct ast_frame *frame)
 		}
 		res = my_dahdi_write(p, (unsigned char *)frame->data.ptr, frame->datalen, idx, 0);
 	} else {
+		ast_mutex_unlock(&p->lock);
 		ast_log(LOG_WARNING, "Cannot handle frames in %s format\n",
 			ast_format_get_name(frame->subclass.format));
 		return -1;
 	}
+	ast_mutex_unlock(&p->lock);
 	if (res < 0) {
 		ast_log(LOG_WARNING, "write failed: %s\n", strerror(errno));
 		return -1;
@@ -12335,6 +12366,7 @@ static struct dahdi_pvt *mkintf(int channel, const struct dahdi_chan_conf *conf,
 #if defined(HAVE_PRI_MCID)
 						pris[span].pri.mcid_send = conf->pri.pri.mcid_send;
 #endif	/* defined(HAVE_PRI_MCID) */
+						pris[span].pri.force_restart_unavailable_chans = conf->pri.pri.force_restart_unavailable_chans;
 #if defined(HAVE_PRI_DATETIME_SEND)
 						pris[span].pri.datetime_send = conf->pri.pri.datetime_send;
 #endif	/* defined(HAVE_PRI_DATETIME_SEND) */
@@ -12581,7 +12613,11 @@ static struct dahdi_pvt *mkintf(int channel, const struct dahdi_chan_conf *conf,
 
 			mailbox_specific_topic = ast_mwi_topic(tmp->mailbox);
 			if (mailbox_specific_topic) {
-				tmp->mwi_event_sub = stasis_subscribe_pool(mailbox_specific_topic, mwi_event_cb, NULL);
+				/* This module does not handle MWI in an event-based manner.  However, it
+				 * subscribes to MWI for each mailbox that is configured so that the core
+				 * knows that we care about it.  Then, chan_dahdi will get the MWI from the
+				 * event cache instead of checking the mailbox directly. */
+				tmp->mwi_event_sub = stasis_subscribe_pool(mailbox_specific_topic, stasis_subscription_cb_noop, NULL);
 			}
 		}
 #ifdef HAVE_DAHDI_LINEREVERSE_VMWI
@@ -12786,6 +12822,7 @@ static struct dahdi_pvt *mkintf(int channel, const struct dahdi_chan_conf *conf,
 				analog_p->transfer = conf->chan.transfer;
 				analog_p->transfertobusy = conf->chan.transfertobusy;
 				analog_p->use_callerid = tmp->use_callerid;
+				analog_p->usedistinctiveringdetection = tmp->usedistinctiveringdetection;
 				analog_p->use_smdi = tmp->use_smdi;
 				analog_p->smdi_iface = tmp->smdi_iface;
 				analog_p->outsigmod = ANALOG_SIG_NONE;
@@ -16066,7 +16103,7 @@ static int action_dahdishowchannels(struct mansession *s, const struct message *
 	struct dahdi_pvt *tmp = NULL;
 	const char *id = astman_get_header(m, "ActionID");
 	const char *dahdichannel = astman_get_header(m, "DAHDIChannel");
-	char idText[256] = "";
+	char idText[256];
 	int channels = 0;
 	int dahdichanquery;
 
@@ -16075,9 +16112,12 @@ static int action_dahdishowchannels(struct mansession *s, const struct message *
 		dahdichanquery = -1;
 	}
 
-	astman_send_ack(s, m, "DAHDI channel status will follow");
-	if (!ast_strlen_zero(id))
+	idText[0] = '\0';
+	if (!ast_strlen_zero(id)) {
 		snprintf(idText, sizeof(idText), "ActionID: %s\r\n", id);
+	}
+
+	astman_send_listack(s, m, "DAHDI channel status will follow", "start");
 
 	ast_mutex_lock(&iflock);
 
@@ -16140,13 +16180,9 @@ static int action_dahdishowchannels(struct mansession *s, const struct message *
 
 	ast_mutex_unlock(&iflock);
 
-	astman_append(s,
-		"Event: DAHDIShowChannelsComplete\r\n"
-		"%s"
-		"Items: %d\r\n"
-		"\r\n",
-		idText,
-		channels);
+	astman_send_list_complete_start(s, m, "DAHDIShowChannelsComplete", channels);
+	astman_append(s, "Items: %d\r\n", channels);
+	astman_send_list_complete_end(s);
 	return 0;
 }
 
@@ -16175,7 +16211,7 @@ static int action_prishowspans(struct mansession *s, const struct message *m)
 		action_id[0] = '\0';
 	}
 
-	astman_send_ack(s, m, "Span status will follow");
+	astman_send_listack(s, m, "Span status will follow", "start");
 
 	count = 0;
 	for (idx = 0; idx < ARRAY_LEN(pris); ++idx) {
@@ -16192,14 +16228,9 @@ static int action_prishowspans(struct mansession *s, const struct message *m)
 		}
 	}
 
-	astman_append(s,
-		"Event: %sComplete\r\n"
-		"Items: %d\r\n"
-		"%s"
-		"\r\n",
-		show_cmd,
-		count,
-		action_id);
+	astman_send_list_complete_start(s, m, "PRIShowSpansComplete", count);
+	astman_append(s, "Items: %d\r\n", count);
+	astman_send_list_complete_end(s);
 	return 0;
 }
 #endif	/* defined(HAVE_PRI) */
@@ -18252,6 +18283,8 @@ static int process_dahdi(struct dahdi_chan_conf *confp, const char *cat, struct 
 				else
 					ast_log(LOG_WARNING, "'%s' is not a valid reset interval, should be >= 60 seconds or 'never' at line %d.\n",
 						v->value, v->lineno);
+			} else if (!strcasecmp(v->name, "force_restart_unavailable_chans")) {
+				confp->pri.pri.force_restart_unavailable_chans = ast_true(v->value);
 			} else if (!strcasecmp(v->name, "minunused")) {
 				confp->pri.pri.minunused = atoi(v->value);
 			} else if (!strcasecmp(v->name, "minidle")) {
@@ -18800,6 +18833,11 @@ static int process_dahdi(struct dahdi_chan_conf *confp, const char *cat, struct 
 					cadence_is_ok = 0;
 				}
 
+				/* This check is only needed to satisfy the compiler that element_count can't cause an out of bounds */
+				if (element_count >= ARRAY_LEN(c)) {
+					element_count = ARRAY_LEN(c) - 1;
+				}
+
 				/* Ring cadences cannot be negative */
 				for (i = 0; i < element_count; i++) {
 					if (c[i] == 0) {
@@ -18925,12 +18963,6 @@ static int process_dahdi(struct dahdi_chan_conf *confp, const char *cat, struct 
 			ast_log(LOG_WARNING, "Ignoring any changes to '%s' (on reload) at line %d.\n", v->name, v->lineno);
 	}
 
-	/* Since confp has already filled invidual dahdi_pvt objects with channels at this point, clear the variables in confp's pvt. */
-	if (confp->chan.vars) {
-		ast_variables_destroy(confp->chan.vars);
-		confp->chan.vars = NULL;
-	}
-
 	if (dahdichan) {
 		/* Process the deferred dahdichan value. */
 		if (build_channels(confp, dahdichan->value, reload, dahdichan->lineno)) {
@@ -18942,6 +18974,15 @@ static int process_dahdi(struct dahdi_chan_conf *confp, const char *cat, struct 
 				return -1;
 			}
 		}
+	}
+
+	/*
+	 * Since confp has already filled individual dahdi_pvt objects with channels
+	 * at this point, clear the variables in confp's pvt.
+	 */
+	if (confp->chan.vars) {
+		ast_variables_destroy(confp->chan.vars);
+		confp->chan.vars = NULL;
 	}
 
 	/* mark the first channels of each DAHDI span to watch for their span alarms */

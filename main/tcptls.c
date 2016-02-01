@@ -31,7 +31,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 425991 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #ifdef HAVE_FCNTL_H
 #include <fcntl.h>
@@ -400,7 +400,11 @@ static int tcptls_stream_close(void *cookie)
 
 			if (!stream->ssl->server) {
 				/* For client threads, ensure that the error stack is cleared */
+#if OPENSSL_VERSION_NUMBER >= 0x10000000L
+				ERR_remove_thread_state(NULL);
+#else
 				ERR_remove_state(0);
+#endif	/* OPENSSL_VERSION_NUMBER >= 0x10000000L */
 			}
 
 			SSL_free(stream->ssl);
@@ -640,9 +644,15 @@ static void *handle_tcptls_connection(void *data)
 							break;
 						}
 						str = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, pos));
-						ASN1_STRING_to_UTF8(&str2, str);
+						ret = ASN1_STRING_to_UTF8(&str2, str);
+						if (ret < 0) {
+							continue;
+						}
+
 						if (str2) {
-							if (!strcasecmp(tcptls_session->parent->hostname, (char *) str2)) {
+							if (strlen((char *) str2) != ret) {
+								ast_log(LOG_WARNING, "Invalid certificate common name length (contains NULL bytes?)\n");
+							} else if (!strcasecmp(tcptls_session->parent->hostname, (char *) str2)) {
 								found = 1;
 							}
 							ast_debug(3, "SSL Common Name compare s1='%s' s2='%s'\n", tcptls_session->parent->hostname, str2);
@@ -708,8 +718,9 @@ void *ast_tcptls_server_root(void *data)
 		}
 		fd = ast_accept(desc->accept_fd, &addr);
 		if (fd < 0) {
-			if ((errno != EAGAIN) && (errno != EINTR)) {
+			if ((errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR) && (errno != ECONNABORTED)) {
 				ast_log(LOG_ERROR, "Accept failed: %s\n", strerror(errno));
+				break;
 			}
 			continue;
 		}
@@ -768,10 +779,13 @@ static int __ssl_setup(struct ast_tls_config *cfg, int client)
 			cfg->ssl_ctx = SSL_CTX_new(SSLv2_client_method());
 		} else
 #endif
+#ifndef OPENSSL_NO_SSL3_METHOD
 		if (ast_test_flag(&cfg->flags, AST_SSL_SSLV3_CLIENT)) {
 			ast_log(LOG_WARNING, "Usage of SSLv3 is discouraged due to known vulnerabilities. Please use 'tlsv1' or leave the TLS method unspecified!\n");
 			cfg->ssl_ctx = SSL_CTX_new(SSLv3_client_method());
-		} else if (ast_test_flag(&cfg->flags, AST_SSL_TLSV1_CLIENT)) {
+		} else
+#endif
+		if (ast_test_flag(&cfg->flags, AST_SSL_TLSV1_CLIENT)) {
 			cfg->ssl_ctx = SSL_CTX_new(TLSv1_client_method());
 		} else {
 			disable_ssl = 1;

@@ -103,6 +103,9 @@ void bridge_channel_settle_owed_events(struct ast_bridge *orig_bridge, struct as
  *
  * \param bridge_channel Channel to push.
  *
+ * \note A ref is not held by bridge_channel->swap when calling because the
+ * push with swap happens immediately.
+ *
  * \note On entry, bridge_channel->bridge is already locked.
  *
  * \retval 0 on success.
@@ -127,19 +130,63 @@ int bridge_channel_internal_push(struct ast_bridge_channel *bridge_channel);
 void bridge_channel_internal_pull(struct ast_bridge_channel *bridge_channel);
 
 /*!
+ * \brief Internal bridge channel wait condition and associated result.
+ */
+struct bridge_channel_internal_cond {
+	/*! Lock for the data structure */
+	ast_mutex_t lock;
+	/*! Wait condition */
+	ast_cond_t cond;
+	/*! Wait until done */
+	int done;
+	/*! The bridge channel */
+	struct ast_bridge_channel *bridge_channel;
+};
+
+/*!
  * \internal
- * \brief Join the bridge_channel to the bridge
+ * \brief Wait for the expected signal.
+ * \since 13.5.0
+ *
+ * \param cond the wait object
+ *
+ * \return Nothing
+ */
+void bridge_channel_internal_wait(struct bridge_channel_internal_cond *cond);
+
+/*!
+ * \internal
+ * \brief Signal the condition wait.
+ * \since 13.5.0
+ *
+ * \param cond the wait object
+ *
+ * \return Nothing
+ */
+void bridge_channel_internal_signal(struct bridge_channel_internal_cond *cond);
+
+/*!
+ * \internal
+ * \brief Join the bridge_channel to the bridge (blocking)
  *
  * \param bridge_channel The Channel in the bridge
+ * \param cond data used for signaling
+ *
+ * \note The bridge_channel->swap holds a channel reference for the swap
+ * channel going into the bridging system.  The ref ensures that the swap
+ * pointer is valid for the bridge subclass push callbacks.  The pointer
+ * will be NULL on return if the ref was consumed.
+ *
+ * \details
+ * This API call puts the bridge_channel into the bridge and handles the
+ * bridge_channel's processing of events while it is in the bridge.  It
+ * will return when the channel has been instructed to leave the bridge.
  *
  * \retval 0 bridge channel successfully joined the bridge
  * \retval -1 bridge channel failed to join the bridge
- *
- * \note This API call starts the bridge_channel's processing of events while
- * it is in the bridge. It will return when the channel has been instructed to
- * leave the bridge.
  */
-int bridge_channel_internal_join(struct ast_bridge_channel *bridge_channel);
+int bridge_channel_internal_join(struct ast_bridge_channel *bridge_channel,
+				 struct bridge_channel_internal_cond *cond);
 
 /*!
  * \internal

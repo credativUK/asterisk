@@ -37,7 +37,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 431327 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <curl/curl.h>
 
@@ -171,7 +171,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 431327 $")
 #define CURLVERSION_ATLEAST(a,b,c) \
 	((LIBCURL_VERSION_MAJOR > (a)) || ((LIBCURL_VERSION_MAJOR == (a)) && (LIBCURL_VERSION_MINOR > (b))) || ((LIBCURL_VERSION_MAJOR == (a)) && (LIBCURL_VERSION_MINOR == (b)) && (LIBCURL_VERSION_PATCH >= (c))))
 
-#define CURLOPT_SPECIAL_HASHCOMPAT -500
+#define CURLOPT_SPECIAL_HASHCOMPAT ((CURLoption) -500)
 
 static void curlds_free(void *data);
 
@@ -199,6 +199,7 @@ static void curlds_free(void *data)
 		free(setting);
 	}
 	AST_LIST_HEAD_DESTROY(list);
+	ast_free(list);
 }
 
 enum optiontype {
@@ -653,6 +654,7 @@ static int acf_curl_helper(struct ast_channel *chan, const char *cmd, char *info
 			curl_easy_setopt(*curl, cur->key, cur->value);
 		}
 	}
+	AST_LIST_UNLOCK(&global_curl_info);
 
 	if (chan && (store = ast_channel_datastore_find(chan, &curl_info, NULL))) {
 		list = store->data;
@@ -691,7 +693,6 @@ static int acf_curl_helper(struct ast_channel *chan, const char *cmd, char *info
 	if (store) {
 		AST_LIST_UNLOCK(list);
 	}
-	AST_LIST_UNLOCK(&global_curl_info);
 
 	if (args.postdata) {
 		curl_easy_setopt(*curl, CURLOPT_POST, 0);

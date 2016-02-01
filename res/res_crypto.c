@@ -33,7 +33,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419592 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/paths.h"	/* use ast_config_AST_KEY_DIR */
 #include <openssl/ssl.h>
@@ -532,7 +532,7 @@ static void md52sum(char *sum, unsigned char *md5)
 {
 	int x;
 	for (x = 0; x < 16; x++) {
-		sum += sprintf(sum, "%02x", (unsigned)*(md5++));
+		sum += sprintf(sum, "%02hhx", *(md5++));
 	}
 }
 

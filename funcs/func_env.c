@@ -27,7 +27,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 413599 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <sys/stat.h>   /* stat(2) */
 
@@ -561,7 +561,7 @@ static int file_read(struct ast_channel *chan, const char *cmd, char *data, stru
 
 			/* Don't go past the length requested */
 			if (off_i + toappend > offset + length) {
-				toappend = length - off_i;
+				toappend = MIN(offset + length - off_i, flength - off_i);
 			}
 
 			ast_str_append_substr(buf, len, fbuf, toappend);
@@ -725,7 +725,7 @@ static int file_read(struct ast_channel *chan, const char *cmd, char *data, stru
 				}
 			}
 			ast_debug(3, "length_offset=%" PRId64 ", length_offset - i=%" PRId64 "\n", length_offset, length_offset - i);
-			ast_str_append_substr(buf, len, fbuf, length_offset >= 0 ? length_offset - i : flength > i + sizeof(fbuf)) ? sizeof(fbuf) : flength - i;
+			ast_str_append_substr(buf, len, fbuf, (length_offset >= 0) ? length_offset - i : (flength > i + sizeof(fbuf)) ? sizeof(fbuf) : flength - i);
 
 			if (length_offset >= 0) {
 				break;

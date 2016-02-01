@@ -33,13 +33,14 @@
 
 /*** MODULEINFO
 	<depend type="module">res_ari</depend>
+	<depend type="module">res_ari_model</depend>
 	<depend type="module">res_stasis</depend>
 	<support_level>core</support_level>
  ***/
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419592 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/app.h"
 #include "asterisk/module.h"
@@ -124,6 +125,10 @@ int ast_ari_channels_originate_parse_body(
 	if (field) {
 		args->priority = ast_json_integer_get(field);
 	}
+	field = ast_json_object_get(body, "label");
+	if (field) {
+		args->label = ast_json_string_get(field);
+	}
 	field = ast_json_object_get(body, "app");
 	if (field) {
 		args->app = ast_json_string_get(field);
@@ -147,6 +152,10 @@ int ast_ari_channels_originate_parse_body(
 	field = ast_json_object_get(body, "otherChannelId");
 	if (field) {
 		args->other_channel_id = ast_json_string_get(field);
+	}
+	field = ast_json_object_get(body, "originator");
+	if (field) {
+		args->originator = ast_json_string_get(field);
 	}
 	return 0;
 }
@@ -184,6 +193,9 @@ static void ast_ari_channels_originate_cb(
 		if (strcmp(i->name, "priority") == 0) {
 			args.priority = atol(i->value);
 		} else
+		if (strcmp(i->name, "label") == 0) {
+			args.label = (i->value);
+		} else
 		if (strcmp(i->name, "app") == 0) {
 			args.app = (i->value);
 		} else
@@ -202,6 +214,9 @@ static void ast_ari_channels_originate_cb(
 		if (strcmp(i->name, "otherChannelId") == 0) {
 			args.other_channel_id = (i->value);
 		} else
+		if (strcmp(i->name, "originator") == 0) {
+			args.originator = (i->value);
+		} else
 		{}
 	}
 	/* Look for a JSON request entity */
@@ -219,7 +234,7 @@ static void ast_ari_channels_originate_cb(
 			goto fin;
 		}
 	}
-	args.variables = ast_json_ref(body);
+	args.variables = body;
 	ast_ari_channels_originate(headers, &args, response);
 #if defined(AST_DEVMODE)
 	code = response->response_code;
@@ -334,6 +349,10 @@ int ast_ari_channels_originate_with_id_parse_body(
 	if (field) {
 		args->priority = ast_json_integer_get(field);
 	}
+	field = ast_json_object_get(body, "label");
+	if (field) {
+		args->label = ast_json_string_get(field);
+	}
 	field = ast_json_object_get(body, "app");
 	if (field) {
 		args->app = ast_json_string_get(field);
@@ -353,6 +372,10 @@ int ast_ari_channels_originate_with_id_parse_body(
 	field = ast_json_object_get(body, "otherChannelId");
 	if (field) {
 		args->other_channel_id = ast_json_string_get(field);
+	}
+	field = ast_json_object_get(body, "originator");
+	if (field) {
+		args->originator = ast_json_string_get(field);
 	}
 	return 0;
 }
@@ -390,6 +413,9 @@ static void ast_ari_channels_originate_with_id_cb(
 		if (strcmp(i->name, "priority") == 0) {
 			args.priority = atol(i->value);
 		} else
+		if (strcmp(i->name, "label") == 0) {
+			args.label = (i->value);
+		} else
 		if (strcmp(i->name, "app") == 0) {
 			args.app = (i->value);
 		} else
@@ -404,6 +430,9 @@ static void ast_ari_channels_originate_with_id_cb(
 		} else
 		if (strcmp(i->name, "otherChannelId") == 0) {
 			args.other_channel_id = (i->value);
+		} else
+		if (strcmp(i->name, "originator") == 0) {
+			args.originator = (i->value);
 		} else
 		{}
 	}
@@ -428,7 +457,7 @@ static void ast_ari_channels_originate_with_id_cb(
 			goto fin;
 		}
 	}
-	args.variables = ast_json_ref(body);
+	args.variables = body;
 	ast_ari_channels_originate_with_id(headers, &args, response);
 #if defined(AST_DEVMODE)
 	code = response->response_code;
@@ -578,6 +607,10 @@ int ast_ari_channels_continue_in_dialplan_parse_body(
 	if (field) {
 		args->priority = ast_json_integer_get(field);
 	}
+	field = ast_json_object_get(body, "label");
+	if (field) {
+		args->label = ast_json_string_get(field);
+	}
 	return 0;
 }
 
@@ -610,6 +643,9 @@ static void ast_ari_channels_continue_in_dialplan_cb(
 		} else
 		if (strcmp(i->name, "priority") == 0) {
 			args.priority = atoi(i->value);
+		} else
+		if (strcmp(i->name, "label") == 0) {
+			args.label = (i->value);
 		} else
 		{}
 	}
@@ -664,6 +700,106 @@ static void ast_ari_channels_continue_in_dialplan_cb(
 
 	if (!is_valid) {
 		ast_log(LOG_ERROR, "Response validation failed for /channels/{channelId}/continue\n");
+		ast_ari_response_error(response, 500,
+			"Internal Server Error", "Response validation failed");
+	}
+#endif /* AST_DEVMODE */
+
+fin: __attribute__((unused))
+	return;
+}
+int ast_ari_channels_redirect_parse_body(
+	struct ast_json *body,
+	struct ast_ari_channels_redirect_args *args)
+{
+	struct ast_json *field;
+	/* Parse query parameters out of it */
+	field = ast_json_object_get(body, "endpoint");
+	if (field) {
+		args->endpoint = ast_json_string_get(field);
+	}
+	return 0;
+}
+
+/*!
+ * \brief Parameter parsing callback for /channels/{channelId}/redirect.
+ * \param get_params GET parameters in the HTTP request.
+ * \param path_vars Path variables extracted from the request.
+ * \param headers HTTP headers.
+ * \param[out] response Response to the HTTP request.
+ */
+static void ast_ari_channels_redirect_cb(
+	struct ast_tcptls_session_instance *ser,
+	struct ast_variable *get_params, struct ast_variable *path_vars,
+	struct ast_variable *headers, struct ast_ari_response *response)
+{
+	struct ast_ari_channels_redirect_args args = {};
+	struct ast_variable *i;
+	RAII_VAR(struct ast_json *, body, NULL, ast_json_unref);
+#if defined(AST_DEVMODE)
+	int is_valid;
+	int code;
+#endif /* AST_DEVMODE */
+
+	for (i = get_params; i; i = i->next) {
+		if (strcmp(i->name, "endpoint") == 0) {
+			args.endpoint = (i->value);
+		} else
+		{}
+	}
+	for (i = path_vars; i; i = i->next) {
+		if (strcmp(i->name, "channelId") == 0) {
+			args.channel_id = (i->value);
+		} else
+		{}
+	}
+	/* Look for a JSON request entity */
+	body = ast_http_get_json(ser, headers);
+	if (!body) {
+		switch (errno) {
+		case EFBIG:
+			ast_ari_response_error(response, 413, "Request Entity Too Large", "Request body too large");
+			goto fin;
+		case ENOMEM:
+			ast_ari_response_error(response, 500, "Internal Server Error", "Error processing request");
+			goto fin;
+		case EIO:
+			ast_ari_response_error(response, 400, "Bad Request", "Error parsing request body");
+			goto fin;
+		}
+	}
+	if (ast_ari_channels_redirect_parse_body(body, &args)) {
+		ast_ari_response_alloc_failed(response);
+		goto fin;
+	}
+	ast_ari_channels_redirect(headers, &args, response);
+#if defined(AST_DEVMODE)
+	code = response->response_code;
+
+	switch (code) {
+	case 0: /* Implementation is still a stub, or the code wasn't set */
+		is_valid = response->message == NULL;
+		break;
+	case 500: /* Internal Server Error */
+	case 501: /* Not Implemented */
+	case 400: /* Endpoint parameter not provided */
+	case 404: /* Channel or endpoint not found */
+	case 409: /* Channel not in a Stasis application */
+	case 422: /* Endpoint is not the same type as the channel */
+		is_valid = 1;
+		break;
+	default:
+		if (200 <= code && code <= 299) {
+			is_valid = ast_ari_validate_void(
+				response->message);
+		} else {
+			ast_log(LOG_ERROR, "Invalid error response %d for /channels/{channelId}/redirect\n", code);
+			is_valid = 0;
+		}
+	}
+
+	if (!is_valid) {
+		ast_log(LOG_ERROR, "Response validation failed for /channels/{channelId}/redirect\n");
 		ast_ari_response_error(response, 500,
 			"Internal Server Error", "Response validation failed");
 	}
@@ -2038,7 +2174,7 @@ static void ast_ari_channels_get_channel_var_cb(
 	case 500: /* Internal Server Error */
 	case 501: /* Not Implemented */
 	case 400: /* Missing variable parameter. */
-	case 404: /* Channel not found */
+	case 404: /* Channel or variable not found */
 	case 409: /* Channel not in a Stasis application */
 		is_valid = 1;
 		break;
@@ -2427,6 +2563,15 @@ static struct stasis_rest_handlers channels_channelId_continue = {
 	.children = {  }
 };
 /*! \brief REST handler for /api-docs/channels.{format} */
+static struct stasis_rest_handlers channels_channelId_redirect = {
+	.path_segment = "redirect",
+	.callbacks = {
+		[AST_HTTP_POST] = ast_ari_channels_redirect_cb,
+	},
+	.num_children = 0,
+	.children = {  }
+};
+/*! \brief REST handler for /api-docs/channels.{format} */
 static struct stasis_rest_handlers channels_channelId_answer = {
 	.path_segment = "answer",
 	.callbacks = {
@@ -2560,8 +2705,8 @@ static struct stasis_rest_handlers channels_channelId = {
 		[AST_HTTP_POST] = ast_ari_channels_originate_with_id_cb,
 		[AST_HTTP_DELETE] = ast_ari_channels_hangup_cb,
 	},
-	.num_children = 12,
-	.children = { &channels_channelId_continue,&channels_channelId_answer,&channels_channelId_ring,&channels_channelId_dtmf,&channels_channelId_mute,&channels_channelId_hold,&channels_channelId_moh,&channels_channelId_silence,&channels_channelId_play,&channels_channelId_record,&channels_channelId_variable,&channels_channelId_snoop, }
+	.num_children = 13,
+	.children = { &channels_channelId_continue,&channels_channelId_redirect,&channels_channelId_answer,&channels_channelId_ring,&channels_channelId_dtmf,&channels_channelId_mute,&channels_channelId_hold,&channels_channelId_moh,&channels_channelId_silence,&channels_channelId_play,&channels_channelId_record,&channels_channelId_variable,&channels_channelId_snoop, }
 };
 /*! \brief REST handler for /api-docs/channels.{format} */
 static struct stasis_rest_handlers channels = {

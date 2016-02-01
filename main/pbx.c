@@ -29,7 +29,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 427711 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/_private.h"
 #include "asterisk/paths.h"	/* use ast_config_AST_SYSTEM_NAME */
@@ -72,6 +72,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 427711 $")
 #include "asterisk/astobj2.h"
 #include "asterisk/stasis_channels.h"
 #include "asterisk/dial.h"
+#include "asterisk/vector.h"
 
 /*!
  * \note I M P O R T A N T :
@@ -1046,8 +1047,11 @@ struct ast_hint {
 
 	char context_name[AST_MAX_CONTEXT];/*!< Context of destroyed hint extension. */
 	char exten_name[AST_MAX_EXTENSION];/*!< Extension of destroyed hint extension. */
+
+	AST_VECTOR(, char *) devices; /*!< Devices associated with the hint */
 };
 
+STASIS_MESSAGE_TYPE_DEFN_LOCAL(hint_change_message_type);
 
 #define HINTDEVICE_DATA_LENGTH 16
 AST_THREADSTORAGE(hintdevice_data);
@@ -1077,15 +1081,28 @@ struct ast_hintdevice {
 	char hintdevice[1];
 };
 
-
 /*!
  * \note Using the device for hash
  */
 static int hintdevice_hash_cb(const void *obj, const int flags)
 {
-	const struct ast_hintdevice *ext = obj;
+	const struct ast_hintdevice *ext;
+	const char *key;
 
-	return ast_str_case_hash(ext->hintdevice);
+	switch (flags & OBJ_SEARCH_MASK) {
+	case OBJ_SEARCH_KEY:
+		key = obj;
+		break;
+	case OBJ_SEARCH_OBJECT:
+		ext = obj;
+		key = ext->hintdevice;
+		break;
+	default:
+		ast_assert(0);
+		return 0;
+	}
+
+	return ast_str_case_hash(key);
 }
 /*!
  * \note Devices on hints are not unique so no CMP_STOP is returned
@@ -1094,29 +1111,58 @@ static int hintdevice_hash_cb(const void *obj, const int flags)
  */
 static int hintdevice_cmp_multiple(void *obj, void *arg, int flags)
 {
-	struct ast_hintdevice *ext = obj, *ext2 = arg;
+	struct ast_hintdevice *left = obj;
+	struct ast_hintdevice *right = arg;
+	const char *right_key = arg;
+	int cmp;
 
-	return !strcasecmp(ext->hintdevice, ext2->hintdevice) ? CMP_MATCH  : 0;
+	switch (flags & OBJ_SEARCH_MASK) {
+	case OBJ_SEARCH_OBJECT:
+		right_key = right->hintdevice;
+		/* Fall through */
+	case OBJ_SEARCH_KEY:
+		cmp = strcasecmp(left->hintdevice, right_key);
+		break;
+	case OBJ_SEARCH_PARTIAL_KEY:
+		/*
+		* We could also use a partial key struct containing a length
+		* so strlen() does not get called for every comparison instead.
+		*/
+		cmp = strncmp(left->hintdevice, right_key, strlen(right_key));
+		break;
+	default:
+		ast_assert(0);
+		cmp = 0;
+		break;
+	}
+	return cmp ? 0 : CMP_MATCH;
 }
 
-/*
- * \details This is used with ao2_callback to remove old devices
- * when they are linked to the hint
-*/
-static int hintdevice_remove_cb(void *deviceobj, void *arg, int flags)
+/*! \internal \brief \c ao2_callback function to remove hintdevices */
+static int hintdevice_remove_cb(void *obj, void *arg, void *data, int flags)
 {
-	struct ast_hintdevice *device = deviceobj;
-	struct ast_hint *hint = arg;
+	struct ast_hintdevice *candidate = obj;
+	char *device = arg;
+	struct ast_hint *hint = data;
 
-	return (device->hint == hint) ? CMP_MATCH : 0;
+	if (!strcasecmp(candidate->hintdevice, device)
+		&& candidate->hint == hint) {
+		return CMP_MATCH;
+	}
+	return 0;
 }
 
 static int remove_hintdevice(struct ast_hint *hint)
 {
-	/* iterate through all devices and remove the devices which are linked to this hint */
-	ao2_t_callback(hintdevices, OBJ_NODATA | OBJ_MULTIPLE | OBJ_UNLINK,
-		hintdevice_remove_cb, hint,
-		"callback to remove all devices which are linked to a hint");
+	while (AST_VECTOR_SIZE(&hint->devices) > 0) {
+		char *device = AST_VECTOR_GET(&hint->devices, 0);
+
+		ao2_t_callback_data(hintdevices, OBJ_SEARCH_KEY | OBJ_UNLINK | OBJ_NODATA,
+			hintdevice_remove_cb, device, hint, "Remove device from container");
+		AST_VECTOR_REMOVE_UNORDERED(&hint->devices, 0);
+		ast_free(device);
+	}
+
 	return 0;
 }
 
@@ -1159,16 +1205,34 @@ static int add_hintdevice(struct ast_hint *hint, const char *devicelist)
 	ast_str_set(&str, 0, "%s", devicelist);
 	parse = parse_hint_device(str);
 
-	while ((cur = strsep(&parse, "&"))) {
+	/* Spit on '&' and ',' to handle presence hints as well */
+	while ((cur = strsep(&parse, "&,"))) {
+		char *device_name;
+
 		devicelength = strlen(cur);
+		if (!devicelength) {
+			continue;
+		}
+
+		device_name = ast_strdup(cur);
+		if (!device_name) {
+			return -1;
+		}
+
 		device = ao2_t_alloc(sizeof(*device) + devicelength, hintdevice_destroy,
 			"allocating a hintdevice structure");
 		if (!device) {
+			ast_free(device_name);
 			return -1;
 		}
 		strcpy(device->hintdevice, cur);
 		ao2_ref(hint, +1);
 		device->hint = hint;
+		if (AST_VECTOR_APPEND(&hint->devices, device_name)) {
+			ast_free(device_name);
+			ao2_ref(device, -1);
+			return -1;
+		}
 		ao2_t_link(hintdevices, device, "Linking device into hintdevice container.");
 		ao2_t_ref(device, -1, "hintdevice is linked so we can unref");
 	}
@@ -5344,17 +5408,256 @@ static void get_device_state_causing_channels(struct ao2_container *c)
 	ao2_iterator_destroy(&iter);
 }
 
+static void device_state_notify_callbacks(struct ast_hint *hint, struct ast_str **hint_app)
+{
+	struct ao2_iterator cb_iter;
+	struct ast_state_cb *state_cb;
+	int state, same_state;
+	struct ao2_container *device_state_info;
+	int first_extended_cb_call = 1;
+	char context_name[AST_MAX_CONTEXT];
+	char exten_name[AST_MAX_EXTENSION];
+
+	ao2_lock(hint);
+	if (!hint->exten) {
+		/* The extension has already been destroyed */
+		ao2_unlock(hint);
+		return;
+	}
+
+	/*
+	 * Save off strings in case the hint extension gets destroyed
+	 * while we are notifying the watchers.
+	 */
+	ast_copy_string(context_name,
+			ast_get_context_name(ast_get_extension_context(hint->exten)),
+			sizeof(context_name));
+	ast_copy_string(exten_name, ast_get_extension_name(hint->exten),
+			sizeof(exten_name));
+	ast_str_set(hint_app, 0, "%s", ast_get_extension_app(hint->exten));
+	ao2_unlock(hint);
+
+	/*
+	 * Get device state for this hint.
+	 *
+	 * NOTE: We cannot hold any locks while determining the hint
+	 * device state or notifying the watchers without causing a
+	 * deadlock.  (conlock, hints, and hint)
+	 */
+
+	/* Make a container so state3 can fill it if we wish.
+	 * If that failed we simply do not provide the extended state info.
+	 */
+	device_state_info = alloc_device_state_info();
+
+	state = ast_extension_state3(*hint_app, device_state_info);
+	if ((same_state = state == hint->laststate) && (~state & AST_EXTENSION_RINGING)) {
+		ao2_cleanup(device_state_info);
+		return;
+	}
+
+	/* Device state changed since last check - notify the watchers. */
+	hint->laststate = state;	/* record we saw the change */
+
+	/* For general callbacks */
+	cb_iter = ao2_iterator_init(statecbs, 0);
+	for (; !same_state && (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
+		execute_state_callback(state_cb->change_cb,
+				       context_name,
+				       exten_name,
+				       state_cb->data,
+				       AST_HINT_UPDATE_DEVICE,
+				       hint,
+				       NULL);
+	}
+	ao2_iterator_destroy(&cb_iter);
+
+	/* For extension callbacks */
+	/* extended callbacks are called when the state changed or when AST_STATE_RINGING is
+	 * included. Normal callbacks are only called when the state changed.
+	 */
+	cb_iter = ao2_iterator_init(hint->callbacks, 0);
+	for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
+		if (state_cb->extended && first_extended_cb_call) {
+			/* Fill detailed device_state_info now that we know it is used by extd. callback */
+			first_extended_cb_call = 0;
+			get_device_state_causing_channels(device_state_info);
+		}
+		if (state_cb->extended || !same_state) {
+			execute_state_callback(state_cb->change_cb,
+					       context_name,
+					       exten_name,
+					       state_cb->data,
+					       AST_HINT_UPDATE_DEVICE,
+					       hint,
+					       state_cb->extended ? device_state_info : NULL);
+		}
+	}
+	ao2_iterator_destroy(&cb_iter);
+
+	ao2_cleanup(device_state_info);
+}
+
+static void presence_state_notify_callbacks(
+	struct stasis_message *msg, struct ast_hint *hint, struct ast_str **hint_app,
+	struct ast_presence_state_message *presence_state)
+{
+	struct ao2_iterator cb_iter;
+	struct ast_state_cb *state_cb;
+	char context_name[AST_MAX_CONTEXT];
+	char exten_name[AST_MAX_EXTENSION];
+
+	ao2_lock(hint);
+
+	if (!hint->exten) {
+		/* The extension has already been destroyed */
+		ao2_unlock(hint);
+		return;
+	}
+
+	if (hint_change_message_type() != stasis_message_type(msg)) {
+		const char *app;
+		char *parse;
+
+		/* Does this hint monitor the device that changed state? */
+		app = ast_get_extension_app(hint->exten);
+		if (ast_strlen_zero(app)) {
+			/* The hint does not monitor presence at all. */
+			ao2_unlock(hint);
+			return;
+		}
+
+		ast_str_set(hint_app, 0, "%s", app);
+		parse = parse_hint_presence(*hint_app);
+		if (ast_strlen_zero(parse)) {
+			ao2_unlock(hint);
+			return;
+		}
+		if (strcasecmp(parse, presence_state->provider)) {
+			/* The hint does not monitor the presence provider. */
+			ao2_unlock(hint);
+			return;
+		}
+	}
+
+	/*
+	 * Save off strings in case the hint extension gets destroyed
+	 * while we are notifying the watchers.
+	 */
+	ast_copy_string(context_name,
+			ast_get_context_name(ast_get_extension_context(hint->exten)),
+			sizeof(context_name));
+	ast_copy_string(exten_name, ast_get_extension_name(hint->exten),
+			sizeof(exten_name));
+	ast_str_set(hint_app, 0, "%s", ast_get_extension_app(hint->exten));
+
+	/* Check to see if update is necessary */
+	if ((hint->last_presence_state == presence_state->state) &&
+	    ((hint->last_presence_subtype && presence_state->subtype &&
+	      !strcmp(hint->last_presence_subtype, presence_state->subtype)) ||
+	     (!hint->last_presence_subtype && !presence_state->subtype)) &&
+	    ((hint->last_presence_message && presence_state->message &&
+	      !strcmp(hint->last_presence_message, presence_state->message)) ||
+	     (!hint->last_presence_message && !presence_state->message))) {
+		/* this update is the same as the last, do nothing */
+		ao2_unlock(hint);
+		return;
+	}
+
+	/* update new values */
+	ast_free(hint->last_presence_subtype);
+	ast_free(hint->last_presence_message);
+	hint->last_presence_state = presence_state->state;
+	hint->last_presence_subtype = presence_state->subtype ? ast_strdup(presence_state->subtype) : NULL;
+	hint->last_presence_message = presence_state->message ? ast_strdup(presence_state->message) : NULL;
+
+	/*
+	 * NOTE: We cannot hold any locks while notifying
+	 * the watchers without causing a deadlock.
+	 * (conlock, hints, and hint)
+	 */
+	ao2_unlock(hint);
+
+	/* For general callbacks */
+	cb_iter = ao2_iterator_init(statecbs, 0);
+	for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
+		execute_state_callback(state_cb->change_cb,
+				       context_name,
+				       exten_name,
+				       state_cb->data,
+				       AST_HINT_UPDATE_PRESENCE,
+				       hint,
+				       NULL);
+	}
+	ao2_iterator_destroy(&cb_iter);
+
+	/* For extension callbacks */
+	cb_iter = ao2_iterator_init(hint->callbacks, 0);
+	for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_cleanup(state_cb)) {
+		execute_state_callback(state_cb->change_cb,
+				       context_name,
+				       exten_name,
+				       state_cb->data,
+				       AST_HINT_UPDATE_PRESENCE,
+				       hint,
+				       NULL);
+	}
+	ao2_iterator_destroy(&cb_iter);
+}
+
+static int handle_hint_change_message_type(struct stasis_message *msg, enum ast_state_cb_update_reason reason)
+{
+	struct ast_hint *hint;
+	struct ast_str *hint_app;
+
+	if (hint_change_message_type() != stasis_message_type(msg)) {
+		return 0;
+	}
+
+	if (!(hint_app = ast_str_create(1024))) {
+		return -1;
+	}
+
+	hint = stasis_message_data(msg);
+
+	if (reason == AST_HINT_UPDATE_DEVICE) {
+		device_state_notify_callbacks(hint, &hint_app);
+	} else if (reason == AST_HINT_UPDATE_PRESENCE) {
+		char *presence_subtype = NULL;
+		char *presence_message = NULL;
+		int state;
+
+		state = extension_presence_state_helper(
+			hint->exten, &presence_subtype, &presence_message);
+
+		{
+			struct ast_presence_state_message presence_state = {
+				.state = state > 0 ? state : AST_PRESENCE_INVALID,
+				.subtype = presence_subtype,
+				.message = presence_message
+			};
+			presence_state_notify_callbacks(msg, hint, &hint_app, &presence_state);
+		}
+
+		ast_free(presence_subtype);
+		ast_free(presence_message);
+	}
+
+	ast_free(hint_app);
+	return 1;
+}
+
 static void device_state_cb(void *unused, struct stasis_subscription *sub, struct stasis_message *msg)
 {
 	struct ast_device_state_message *dev_state;
-	struct ast_hint *hint;
 	struct ast_str *hint_app;
 	struct ast_hintdevice *device;
 	struct ast_hintdevice *cmpdevice;
 	struct ao2_iterator *dev_iter;
-	struct ao2_iterator cb_iter;
-	char context_name[AST_MAX_CONTEXT];
-	char exten_name[AST_MAX_EXTENSION];
+
+	if (handle_hint_change_message_type(msg, AST_HINT_UPDATE_DEVICE)) {
+		return;
+	}
 
 	if (ast_device_state_message_type() != stasis_message_type(msg)) {
 		return;
@@ -5381,7 +5684,7 @@ static void device_state_cb(void *unused, struct stasis_subscription *sub, struc
 
 	ast_mutex_lock(&context_merge_lock);/* Hold off ast_merge_contexts_and_delete */
 	dev_iter = ao2_t_callback(hintdevices,
-		OBJ_POINTER | OBJ_MULTIPLE,
+		OBJ_SEARCH_OBJECT | OBJ_MULTIPLE,
 		hintdevice_cmp_multiple,
 		cmpdevice,
 		"find devices in container");
@@ -5392,94 +5695,9 @@ static void device_state_cb(void *unused, struct stasis_subscription *sub, struc
 	}
 
 	for (; (device = ao2_iterator_next(dev_iter)); ao2_t_ref(device, -1, "Next device")) {
-		struct ast_state_cb *state_cb;
-		int state;
-		int same_state;
-		struct ao2_container *device_state_info;
-		int first_extended_cb_call = 1;
-
-		if (!device->hint) {
-			/* Should never happen. */
-			continue;
+		if (device->hint) {
+			device_state_notify_callbacks(device->hint, &hint_app);
 		}
-		hint = device->hint;
-
-		ao2_lock(hint);
-		if (!hint->exten) {
-			/* The extension has already been destroyed */
-			ao2_unlock(hint);
-			continue;
-		}
-
-		/*
-		 * Save off strings in case the hint extension gets destroyed
-		 * while we are notifying the watchers.
-		 */
-		ast_copy_string(context_name,
-			ast_get_context_name(ast_get_extension_context(hint->exten)),
-			sizeof(context_name));
-		ast_copy_string(exten_name, ast_get_extension_name(hint->exten),
-			sizeof(exten_name));
-		ast_str_set(&hint_app, 0, "%s", ast_get_extension_app(hint->exten));
-		ao2_unlock(hint);
-
-		/*
-		 * Get device state for this hint.
-		 *
-		 * NOTE: We cannot hold any locks while determining the hint
-		 * device state or notifying the watchers without causing a
-		 * deadlock.  (conlock, hints, and hint)
-		 */
-		/* Make a container so state3 can fill it if we wish.
-		 * If that failed we simply do not provide the extended state info.
-		 */
-		device_state_info = alloc_device_state_info();
-		state = ast_extension_state3(hint_app, device_state_info);
-		if ((same_state = state == hint->laststate) && (~state & AST_EXTENSION_RINGING)) {
-			ao2_cleanup(device_state_info);
-			continue;
-		}
-
-		/* Device state changed since last check - notify the watchers. */
-		hint->laststate = state;	/* record we saw the change */
-
-		/* For general callbacks */
-		cb_iter = ao2_iterator_init(statecbs, 0);
-		for (; !same_state && (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
-			execute_state_callback(state_cb->change_cb,
-				context_name,
-				exten_name,
-				state_cb->data,
-				AST_HINT_UPDATE_DEVICE,
-				hint,
-				NULL);
-		}
-		ao2_iterator_destroy(&cb_iter);
-
-		/* For extension callbacks */
-		/* extended callbacks are called when the state changed or when AST_STATE_RINGING is
-		 * included. Normal callbacks are only called when the state changed.
-		 */
-		cb_iter = ao2_iterator_init(hint->callbacks, 0);
-		for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
-			if (state_cb->extended && first_extended_cb_call) {
-				/* Fill detailed device_state_info now that we know it is used by extd. callback */
-				first_extended_cb_call = 0;
-				get_device_state_causing_channels(device_state_info);
-			}
-			if (state_cb->extended || !same_state) {
-				execute_state_callback(state_cb->change_cb,
-					context_name,
-					exten_name,
-					state_cb->data,
-					AST_HINT_UPDATE_DEVICE,
-					hint,
-					state_cb->extended ? device_state_info : NULL);
-			}
-		}
-		ao2_iterator_destroy(&cb_iter);
-
-		ao2_cleanup(device_state_info);
 	}
 	ast_mutex_unlock(&context_merge_lock);
 
@@ -5693,6 +5911,7 @@ static int hint_id_cmp(void *obj, void *arg, int flags)
 static void destroy_hint(void *obj)
 {
 	struct ast_hint *hint = obj;
+	int i;
 
 	if (hint->callbacks) {
 		struct ast_state_cb *state_cb;
@@ -5722,6 +5941,12 @@ static void destroy_hint(void *obj)
 		}
 		ao2_ref(hint->callbacks, -1);
 	}
+
+	for (i = 0; i < AST_VECTOR_SIZE(&hint->devices); i++) {
+		char *device = AST_VECTOR_GET(&hint->devices, i);
+		ast_free(device);
+	}
+	AST_VECTOR_FREE(&hint->devices);
 	ast_free(hint->last_presence_subtype);
 	ast_free(hint->last_presence_message);
 }
@@ -5783,6 +6008,7 @@ static int ast_add_hint(struct ast_exten *e)
 	if (!hint_new) {
 		return -1;
 	}
+	AST_VECTOR_INIT(&hint_new->devices, 8);
 
 	/* Initialize new hint. */
 	hint_new->callbacks = ao2_container_alloc(1, NULL, hint_id_cmp);
@@ -5829,8 +6055,49 @@ static int ast_add_hint(struct ast_exten *e)
 			ast_get_context_name(ast_get_extension_context(e)));
 	}
 
+	/* if not dynamic */
+	if (!(strstr(e->app, "${") && e->exten[0] == '_')) {
+		struct ast_state_cb *state_cb;
+		struct ao2_iterator cb_iter;
+
+		/* For general callbacks */
+		cb_iter = ao2_iterator_init(statecbs, 0);
+		for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
+			execute_state_callback(state_cb->change_cb,
+					ast_get_context_name(ast_get_extension_context(e)),
+					ast_get_extension_name(e),
+					state_cb->data,
+					AST_HINT_UPDATE_DEVICE,
+					hint_new,
+					NULL);
+		}
+		ao2_iterator_destroy(&cb_iter);
+	}
 	ao2_unlock(hints);
 	ao2_ref(hint_new, -1);
+
+	return 0;
+}
+
+/*! \brief Publish a hint changed event  */
+static int publish_hint_change(struct ast_hint *hint, struct ast_exten *ne)
+{
+	struct stasis_message *message;
+
+	if (!hint_change_message_type()) {
+		return -1;
+	}
+
+	/* The message is going to be published to two topics so the hint needs two refs */
+	if (!(message = stasis_message_create(hint_change_message_type(), ao2_bump(hint)))) {
+		ao2_ref(hint, -1);
+		return -1;
+	}
+
+	stasis_publish(ast_device_state_topic_all(), message);
+	stasis_publish(ast_presence_state_topic_all(), message);
+
+	ao2_ref(message, -1);
 
 	return 0;
 }
@@ -5853,6 +6120,7 @@ static int ast_change_hint(struct ast_exten *oe, struct ast_exten *ne)
 	hint = ao2_find(hints, oe, OBJ_UNLINK);
 	if (!hint) {
 		ao2_unlock(hints);
+		ast_mutex_unlock(&context_merge_lock);
 		return -1;
 	}
 
@@ -5861,20 +6129,23 @@ static int ast_change_hint(struct ast_exten *oe, struct ast_exten *ne)
 	/* Update the hint and put it back in the hints container. */
 	ao2_lock(hint);
 	hint->exten = ne;
+
 	ao2_unlock(hint);
+
 	ao2_link(hints, hint);
 	if (add_hintdevice(hint, ast_get_extension_app(ne))) {
 		ast_log(LOG_WARNING, "Could not add devices for hint: %s@%s.\n",
 			ast_get_extension_name(ne),
 			ast_get_context_name(ast_get_extension_context(ne)));
 	}
-
 	ao2_unlock(hints);
+
+	publish_hint_change(hint, ne);
+
 	ao2_ref(hint, -1);
 
 	return 0;
 }
-
 
 /*! \brief Get hint for channel */
 int ast_get_hint(char *hint, int hintsize, char *name, int namesize, struct ast_channel *c, const char *context, const char *exten)
@@ -7436,7 +7707,7 @@ static char *handle_show_hints(struct ast_cli_entry *e, int cmd, struct ast_cli_
 			continue;
 		}
 		watchers = ao2_container_count(hint->callbacks);
-		sprintf(buf, "%s@%s",
+		snprintf(buf, sizeof(buf), "%s@%s",
 			ast_get_extension_name(hint->exten),
 			ast_get_context_name(ast_get_extension_context(hint->exten)));
 
@@ -8329,14 +8600,13 @@ static int manager_show_dialplan(struct mansession *s, const struct message *m)
 		manager_dpsendack(s, m);
 	}
 
-	astman_append(s, "Event: ShowDialPlanComplete\r\n"
-		"EventList: Complete\r\n"
-		"ListItems: %d\r\n"
+	astman_send_list_complete_start(s, m, "ShowDialPlanComplete", counters.total_items);
+	astman_append(s,
 		"ListExtensions: %d\r\n"
 		"ListPriorities: %d\r\n"
-		"ListContexts: %d\r\n"
-		"%s"
-		"\r\n", counters.total_items, counters.total_exten, counters.total_prio, counters.total_context, idtext);
+		"ListContexts: %d\r\n",
+		counters.total_exten, counters.total_prio, counters.total_context);
+	astman_send_list_complete_end(s);
 
 	/* everything ok */
 	return 0;
@@ -8655,9 +8925,9 @@ struct ast_context *ast_context_find_or_create(struct ast_context **extcontexts,
 		ast_rdlock_contexts();
 		local_contexts = &contexts;
 		tmp = ast_hashtab_lookup(contexts_table, &search);
-		ast_unlock_contexts();
 		if (tmp) {
 			tmp->refcount++;
+			ast_unlock_contexts();
 			return tmp;
 		}
 	} else { /* local contexts just in a linked list; search there for the new context; slow, linear search, but not frequent */
@@ -8681,11 +8951,13 @@ struct ast_context *ast_context_find_or_create(struct ast_context **extcontexts,
 		tmp->refcount = 1;
 	} else {
 		ast_log(LOG_ERROR, "Danger! We failed to allocate a context for %s!\n", name);
+		if (!extcontexts) {
+			ast_unlock_contexts();
+		}
 		return NULL;
 	}
 
 	if (!extcontexts) {
-		ast_wrlock_contexts();
 		tmp->next = *local_contexts;
 		*local_contexts = tmp;
 		ast_hashtab_insert_safe(contexts_table, tmp); /*put this context into the tree */
@@ -8810,7 +9082,7 @@ static void context_merge(struct ast_context **extcontexts, struct ast_hashtab *
 				dupdstr = ast_strdup(prio_item->data);
 
 				res1 = ast_add_extension2(new, 0, prio_item->exten, prio_item->priority, prio_item->label,
-										  prio_item->matchcid ? prio_item->cidmatch : NULL, prio_item->app, dupdstr, prio_item->datad, prio_item->registrar);
+										  prio_item->matchcid ? prio_item->cidmatch : NULL, prio_item->app, dupdstr, ast_free_ptr, prio_item->registrar);
 				if (!res1 && new_exten_item && new_prio_item){
 					ast_verb(3,"Dropping old dialplan item %s/%s/%d [%s(%s)] (registrar=%s) due to conflict with new dialplan\n",
 							context->name, prio_item->exten, prio_item->priority, prio_item->app, (char*)prio_item->data, prio_item->registrar);
@@ -9584,18 +9856,24 @@ int ast_context_add_ignorepat2(struct ast_context *con, const char *value, const
 
 int ast_ignore_pattern(const char *context, const char *pattern)
 {
-	struct ast_context *con = ast_context_find(context);
+	int ret = 0;
+	struct ast_context *con;
 
+	ast_rdlock_contexts();
+	con = ast_context_find(context);
 	if (con) {
 		struct ast_ignorepat *pat;
 
 		for (pat = con->ignorepats; pat; pat = pat->next) {
-			if (ast_extension_match(pat->pattern, pattern))
-				return 1;
+			if (ast_extension_match(pat->pattern, pattern)) {
+				ret = 1;
+				break;
+			}
 		}
 	}
+	ast_unlock_contexts();
 
-	return 0;
+	return ret;
 }
 
 /*
@@ -10717,6 +10995,16 @@ void __ast_context_destroy(struct ast_context *list, struct ast_hashtab *context
 				exten_iter = ast_hashtab_start_traversal(tmp->root_table);
 				while ((exten_item=ast_hashtab_next(exten_iter))) {
 					int end_traversal = 1;
+
+					/*
+					 * If the extension could not be removed from the root_table due to
+					 * a loaded PBX app, it can exist here but have its peer_table be
+					 * destroyed due to a previous pass through this function.
+					 */
+					if (!exten_item->peer_table) {
+						continue;
+					}
+
 					prio_iter = ast_hashtab_start_traversal(exten_item->peer_table);
 					while ((prio_item=ast_hashtab_next(prio_iter))) {
 						char extension[AST_MAX_EXTENSION];
@@ -10791,6 +11079,22 @@ void __ast_context_destroy(struct ast_context *list, struct ast_hashtab *context
 		/* if we have a specific match, we are done, otherwise continue */
 		tmp = con ? NULL : next;
 	}
+}
+
+int ast_context_destroy_by_name(const char *context, const char *registrar)
+{
+	struct ast_context *con;
+	int ret = -1;
+
+	ast_wrlock_contexts();
+	con = ast_context_find(context);
+	if (con) {
+		ast_context_destroy(con, registrar);
+		ret = 0;
+	}
+	ast_unlock_contexts();
+
+	return ret;
 }
 
 void ast_context_destroy(struct ast_context *con, const char *registrar)
@@ -11470,6 +11774,8 @@ int pbx_builtin_setvar_helper(struct ast_channel *chan, const char *name, const 
 	struct ast_var_t *newvariable;
 	struct varshead *headp;
 	const char *nametail = name;
+	/*! True if the old value was not an empty string. */
+	int old_value_existed = 0;
 
 	if (name[strlen(name) - 1] == ')') {
 		char *function = ast_strdupa(name);
@@ -11496,6 +11802,7 @@ int pbx_builtin_setvar_helper(struct ast_channel *chan, const char *name, const 
 		if (strcmp(ast_var_name(newvariable), nametail) == 0) {
 			/* there is already such a variable, delete it */
 			AST_LIST_REMOVE_CURRENT(entries);
+			old_value_existed = !ast_strlen_zero(ast_var_value(newvariable));
 			ast_var_delete(newvariable);
 			break;
 		}
@@ -11508,6 +11815,9 @@ int pbx_builtin_setvar_helper(struct ast_channel *chan, const char *name, const 
 		}
 		AST_LIST_INSERT_HEAD(headp, newvariable, entries);
 		ast_channel_publish_varset(chan, name, value);
+	} else if (old_value_existed) {
+		/* We just deleted a non-empty dialplan variable. */
+		ast_channel_publish_varset(chan, name, "");
 	}
 
 	if (chan)
@@ -11828,13 +12138,13 @@ static int pbx_builtin_sayphonetic(struct ast_channel *chan, const char *data)
 
 static void presence_state_cb(void *unused, struct stasis_subscription *sub, struct stasis_message *msg)
 {
-	struct ast_presence_state_message *presence_state = stasis_message_data(msg);
 	struct ast_hint *hint;
 	struct ast_str *hint_app = NULL;
 	struct ao2_iterator hint_iter;
-	struct ao2_iterator cb_iter;
-	char context_name[AST_MAX_CONTEXT];
-	char exten_name[AST_MAX_EXTENSION];
+
+	if (handle_hint_change_message_type(msg, AST_HINT_UPDATE_PRESENCE)) {
+		return;
+	}
 
 	if (stasis_message_type(msg) != ast_presence_state_message_type()) {
 		return;
@@ -11848,85 +12158,7 @@ static void presence_state_cb(void *unused, struct stasis_subscription *sub, str
 	ast_mutex_lock(&context_merge_lock);/* Hold off ast_merge_contexts_and_delete */
 	hint_iter = ao2_iterator_init(hints, 0);
 	for (; (hint = ao2_iterator_next(&hint_iter)); ao2_cleanup(hint)) {
-		struct ast_state_cb *state_cb;
-		const char *app;
-		char *parse;
-		SCOPED_AO2LOCK(lock, hint);
-
-		if (!hint->exten) {
-			/* The extension has already been destroyed */
-			continue;
-		}
-
-		/* Does this hint monitor the device that changed state? */
-		app = ast_get_extension_app(hint->exten);
-		if (ast_strlen_zero(app)) {
-			/* The hint does not monitor presence at all. */
-			continue;
-		}
-
-		ast_str_set(&hint_app, 0, "%s", app);
-		parse = parse_hint_presence(hint_app);
-		if (ast_strlen_zero(parse)) {
-			continue;
-		}
-		if (strcasecmp(parse, presence_state->provider)) {
-			/* The hint does not monitor the presence provider. */
-			continue;
-		}
-
-		/*
-		 * Save off strings in case the hint extension gets destroyed
-		 * while we are notifying the watchers.
-		 */
-		ast_copy_string(context_name,
-			ast_get_context_name(ast_get_extension_context(hint->exten)),
-			sizeof(context_name));
-		ast_copy_string(exten_name, ast_get_extension_name(hint->exten),
-			sizeof(exten_name));
-		ast_str_set(&hint_app, 0, "%s", ast_get_extension_app(hint->exten));
-
-		/* Check to see if update is necessary */
-		if ((hint->last_presence_state == presence_state->state) &&
-			((hint->last_presence_subtype && presence_state->subtype && !strcmp(hint->last_presence_subtype, presence_state->subtype)) || (!hint->last_presence_subtype && !presence_state->subtype)) &&
-			((hint->last_presence_message && presence_state->message && !strcmp(hint->last_presence_message, presence_state->message)) || (!hint->last_presence_message && !presence_state->message))) {
-
-			/* this update is the same as the last, do nothing */
-			continue;
-		}
-
-		/* update new values */
-		ast_free(hint->last_presence_subtype);
-		ast_free(hint->last_presence_message);
-		hint->last_presence_state = presence_state->state;
-		hint->last_presence_subtype = presence_state->subtype ? ast_strdup(presence_state->subtype) : NULL;
-		hint->last_presence_message = presence_state->message ? ast_strdup(presence_state->message) : NULL;
-
-		/* For general callbacks */
-		cb_iter = ao2_iterator_init(statecbs, 0);
-		for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_ref(state_cb, -1)) {
-			execute_state_callback(state_cb->change_cb,
-				context_name,
-				exten_name,
-				state_cb->data,
-				AST_HINT_UPDATE_PRESENCE,
-				hint,
-				NULL);
-		}
-		ao2_iterator_destroy(&cb_iter);
-
-		/* For extension callbacks */
-		cb_iter = ao2_iterator_init(hint->callbacks, 0);
-		for (; (state_cb = ao2_iterator_next(&cb_iter)); ao2_cleanup(state_cb)) {
-			execute_state_callback(state_cb->change_cb,
-				context_name,
-				exten_name,
-				state_cb->data,
-				AST_HINT_UPDATE_PRESENCE,
-				hint,
-				NULL);
-		}
-		ao2_iterator_destroy(&cb_iter);
+		presence_state_notify_callbacks(msg, hint, &hint_app, stasis_message_data(msg));
 	}
 	ao2_iterator_destroy(&hint_iter);
 	ast_mutex_unlock(&context_merge_lock);
@@ -12032,15 +12264,12 @@ static int action_extensionstatelist(struct mansession *s, const struct message 
 		   ast_extension_state2str(hint->laststate));
 		ao2_unlock(hint);
 	}
-	astman_append(s, "Event: ExtensionStateListComplete\r\n");
-	if (!ast_strlen_zero(action_id)) {
-		astman_append(s, "ActionID: %s\r\n", action_id);
-	}
-	astman_append(s, "EventList: Complete\r\n"
-		"ListItems: %d\r\n\r\n", hint_count);
 
 	ao2_iterator_destroy(&it_hints);
 	ao2_unlock(hints);
+
+	astman_send_list_complete_start(s, m, "ExtensionStateListComplete", hint_count);
+	astman_send_list_complete_end(s);
 
 	return 0;
 }
@@ -12076,7 +12305,7 @@ int load_pbx(void)
 	int res = 0;
 	int x;
 
-	ast_register_atexit(unload_pbx);
+	ast_register_cleanup(unload_pbx);
 
 	/* Initialize the PBX */
 	ast_verb(1, "Asterisk PBX Core Initializing\n");
@@ -12489,15 +12718,20 @@ static int statecbs_cmp(void *obj, void *arg, int flags)
  */
 static void pbx_shutdown(void)
 {
+	STASIS_MESSAGE_TYPE_CLEANUP(hint_change_message_type);
+
 	if (hints) {
+		ao2_container_unregister("hints");
 		ao2_ref(hints, -1);
 		hints = NULL;
 	}
 	if (hintdevices) {
+		ao2_container_unregister("hintdevices");
 		ao2_ref(hintdevices, -1);
 		hintdevices = NULL;
 	}
 	if (statecbs) {
+		ao2_container_unregister("statecbs");
 		ao2_ref(statecbs, -1);
 		statecbs = NULL;
 	}
@@ -12507,13 +12741,59 @@ static void pbx_shutdown(void)
 	pbx_builtin_clear_globals();
 }
 
+static void print_hints_key(void *v_obj, void *where, ao2_prnt_fn *prnt)
+{
+	struct ast_hint *hint = v_obj;
+
+	if (!hint) {
+		return;
+	}
+	prnt(where, "%s@%s", ast_get_extension_name(hint->exten),
+		ast_get_context_name(ast_get_extension_context(hint->exten)));
+}
+
+static void print_hintdevices_key(void *v_obj, void *where, ao2_prnt_fn *prnt)
+{
+	struct ast_hintdevice *hintdevice = v_obj;
+
+	if (!hintdevice) {
+		return;
+	}
+	prnt(where, "%s => %s@%s", hintdevice->hintdevice,
+		ast_get_extension_name(hintdevice->hint->exten),
+		ast_get_context_name(ast_get_extension_context(hintdevice->hint->exten)));
+}
+
+static void print_statecbs_key(void *v_obj, void *where, ao2_prnt_fn *prnt)
+{
+	struct ast_state_cb *state_cb = v_obj;
+
+	if (!state_cb) {
+		return;
+	}
+	prnt(where, "%d", state_cb->id);
+}
+
 int ast_pbx_init(void)
 {
 	hints = ao2_container_alloc(HASH_EXTENHINT_SIZE, hint_hash, hint_cmp);
+	if (hints) {
+		ao2_container_register("hints", hints, print_hints_key);
+	}
 	hintdevices = ao2_container_alloc(HASH_EXTENHINT_SIZE, hintdevice_hash_cb, hintdevice_cmp_multiple);
+	if (hintdevices) {
+		ao2_container_register("hintdevices", hintdevices, print_hintdevices_key);
+	}
 	statecbs = ao2_container_alloc(1, NULL, statecbs_cmp);
+	if (statecbs) {
+		ao2_container_register("statecbs", statecbs, print_statecbs_key);
+	}
 
 	ast_register_cleanup(pbx_shutdown);
+
+	if (STASIS_MESSAGE_TYPE_INIT(hint_change_message_type) != 0) {
+		return -1;
+	}
 
 	return (hints && hintdevices && statecbs) ? 0 : -1;
 }

@@ -102,7 +102,7 @@
 #endif
 #endif
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 428865 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/paths.h"	/* use ast_config_AST_SPOOL_DIR */
 #include <sys/time.h>
@@ -617,6 +617,7 @@ static AST_LIST_HEAD_STATIC(vmstates, vmstate);
 #define VM_MESSAGEWRAP   (1 << 17)  /*!< Wrap around from the last message to the first, and vice-versa */
 #define VM_FWDURGAUTO    (1 << 18)  /*!< Autoset of Urgent flag on forwarded Urgent messages set globally */
 #define ERROR_LOCK_PATH  -100
+#define ERROR_MAX_MSGS   -101
 #define OPERATOR_EXIT     300
 
 enum vm_box {
@@ -1098,6 +1099,8 @@ static void read_password_from_file(const char *secretfn, char *password, int pa
 static int write_password_to_file(const char *secretfn, const char *password);
 static const char *substitute_escapes(const char *value);
 static int message_range_and_existence_check(struct vm_state *vms, const char *msg_ids [], size_t num_msgs, int *msg_nums, struct ast_vm_user *vmu);
+static void notify_new_state(struct ast_vm_user *vmu);
+
 /*!
  * Place a message in the indicated folder
  *
@@ -2171,6 +2174,8 @@ static int imap_retrieve_greeting(const char *dir, const int msgnum, struct ast_
 	char *attachment;
 	int i;
 	BODY *body;
+	int ret = 0;
+	int curr_mbox;
 
 	/* This function is only used for retrieval of IMAP greetings
 	 * regular messages are not retrieved this way, nor are greetings
@@ -2204,6 +2209,10 @@ static int imap_retrieve_greeting(const char *dir, const int msgnum, struct ast_
 	*vms_p->introfn = '\0';
 
 	ast_mutex_lock(&vms_p->lock);
+
+	/* get the current mailbox so that we can point the mailstream back to it later */
+	curr_mbox = get_folder_by_name(vms_p->curbox);
+
 	if (init_mailstream(vms_p, GREETINGS_FOLDER) || !vms_p->mailstream) {
 		ast_log(AST_LOG_ERROR, "IMAP mailstream is NULL or can't init_mailstream\n");
 		ast_mutex_unlock(&vms_p->lock);
@@ -2218,21 +2227,28 @@ static int imap_retrieve_greeting(const char *dir, const int msgnum, struct ast_
 			attachment = ast_strdupa(body->nested.part->next->body.parameter->value);
 		} else {
 			ast_log(AST_LOG_ERROR, "There is no file attached to this IMAP message.\n");
-			ast_mutex_unlock(&vms_p->lock);
-			return -1;
+			ret = -1;
+			break;
 		}
 		filename = strsep(&attachment, ".");
 		if (!strcmp(filename, file)) {
 			ast_copy_string(vms_p->fn, dir, sizeof(vms_p->fn));
 			vms_p->msgArray[vms_p->curmsg] = i + 1;
 			save_body(body, vms_p, "2", attachment, 0);
-			ast_mutex_unlock(&vms_p->lock);
-			return 0;
+			ret = 0;
+			break;
+		}
+	}
+
+	if (curr_mbox != -1) {
+		/* restore previous mbox stream */
+		if (init_mailstream(vms_p, curr_mbox) || !vms_p->mailstream) {
+			ast_log(AST_LOG_ERROR, "IMAP mailstream is NULL or can't init_mailstream\n");
+			ret = -1;
 		}
 	}
 	ast_mutex_unlock(&vms_p->lock);
-
-	return -1;
+	return ret;
 }
 
 static int imap_retrieve_file(const char *dir, const int msgnum, const char *mailbox, const char *context)
@@ -2246,12 +2262,13 @@ static int imap_retrieve_file(const char *dir, const int msgnum, const char *mai
 	FILE *text_file_ptr;
 	int res = 0;
 	struct ast_vm_user *vmu;
+	int curr_mbox;
 
 	if (!(vmu = find_user(NULL, context, mailbox))) {
 		ast_log(LOG_WARNING, "Couldn't find user with mailbox %s@%s\n", mailbox, context);
 		return -1;
 	}
-	
+
 	if (msgnum < 0) {
 		if (imapgreetings) {
 			res = imap_retrieve_greeting(dir, msgnum, vmu);
@@ -2274,6 +2291,19 @@ static int imap_retrieve_file(const char *dir, const int msgnum, const char *mai
 		 * and should have its msgArray properly set up.
 		 */
 		ast_log(LOG_ERROR, "Couldn't find a vm_state for mailbox %s!!! Oh no!\n", vmu->mailbox);
+		res = -1;
+		goto exit;
+	}
+
+	/* Ensure we have the correct mailbox open and have a valid mailstream for it */
+	curr_mbox = get_folder_by_name(vms->curbox);
+	if (curr_mbox < 0) {
+		ast_debug(3, "Mailbox folder curbox not set, defaulting to Inbox\n");
+		curr_mbox = 0;
+	}
+	init_mailstream(vms, curr_mbox);
+	if (!vms->mailstream) {
+		ast_log(AST_LOG_ERROR, "IMAP mailstream for %s is NULL\n", vmu->mailbox);
 		res = -1;
 		goto exit;
 	}
@@ -2428,7 +2458,7 @@ static int __messagecount(const char *context, const char *mailbox, const char *
 	/* We have to get the user before we can open the stream! */
 	vmu = find_user(&vmus, context, mailbox);
 	if (!vmu) {
-		ast_log(AST_LOG_ERROR, "Couldn't find mailbox %s in context %s\n", mailbox, context);
+		ast_log(AST_LOG_WARNING, "Couldn't find mailbox %s in context %s\n", mailbox, context);
 		return -1;
 	} else {
 		/* No IMAP account available */
@@ -2444,7 +2474,6 @@ static int __messagecount(const char *context, const char *mailbox, const char *
 		free_user(vmu);
 		return -1;
 	}
-	ast_assert(msgnum < vms->msg_array_max);
 
 	/* check if someone is accessing this box right now... */
 	vms_p = get_vm_state_by_imapuser(vmu->imapuser, 1);
@@ -3332,7 +3361,7 @@ static char *get_header_by_tag(char *header, char *tag, char *buf, size_t len)
 	if (taglen < 1)
 		return NULL;
 
-	if (!(start = strstr(header, tag)))
+	if (!(start = strcasestr(header, tag)))
 		return NULL;
 
 	/* Since we can be called multiple times we should clear our buffer */
@@ -3741,7 +3770,7 @@ static void odbc_update_msg_id(char *dir, int msg_num, char *msg_id)
 
 /*!
  * \brief Retrieves a file from an ODBC data store.
- * \param dir the path to the file to be retreived.
+ * \param dir the path to the file to be retrieved.
  * \param msgnum the message number, such as within a mailbox folder.
  * 
  * This method is used by the RETRIEVE macro when mailboxes are stored in an ODBC back end.
@@ -6373,6 +6402,7 @@ static int msg_create_from_file(struct ast_vm_recording_data *recdata)
 		}
 
 		STORE(dir, recipient->mailbox, recipient->context, msgnum, NULL, recipient, fmt, 0, vms, "", msg_id);
+		notify_new_state(recipient);
 	}
 
 	free_user(recipient);
@@ -7064,7 +7094,7 @@ static int save_to_folder(struct ast_vm_user *vmu, struct vm_state *vms, int msg
 	} else {
 		if (x >= vmu->maxmsg) {
 			ast_unlock_path(ddir);
-			return -1;
+			return ERROR_MAX_MSGS;
 		}
 	}
 	make_file(sfn, sizeof(sfn), dir, msg);
@@ -8011,7 +8041,7 @@ static int notify_new_message(struct ast_channel *chan, struct ast_vm_user *vmu,
  *   - attempt to determine the context and and mailbox, and then invoke leave_message() function to record and store the message.
  *
  * When in the forward message mode (is_new_message == 0):
- *   - retreives the current message to be forwarded
+ *   - retrieves the current message to be forwarded
  *   - copies the original message to a temporary file, so updates to the envelope can be done.
  *   - determines the target mailbox and folders
  *   - copies the message into the target mailbox, using copy_message() or by generating the message into an email attachment if using imap folders.
@@ -8889,7 +8919,7 @@ static int close_mailbox(struct vm_state *vms, struct ast_vm_user *vmu)
 		} else if ((!strcasecmp(vms->curbox, "INBOX") || !strcasecmp(vms->curbox, "Urgent")) && vms->heard[x] && ast_test_flag(vmu, VM_MOVEHEARD) && !vms->deleted[x]) {
 			/* Move to old folder before deleting */
 			res = save_to_folder(vmu, vms, x, 1, NULL, 0);
-			if (res == ERROR_LOCK_PATH) {
+			if (res == ERROR_LOCK_PATH || res == ERROR_MAX_MSGS) {
 				/* If save failed do not delete the message */
 				ast_log(AST_LOG_WARNING, "Save failed.  Not moving message: %s.\n", res == ERROR_LOCK_PATH ? "unable to lock path" : "destination folder full");
 				vms->deleted[x] = 0;
@@ -9070,7 +9100,7 @@ static int vm_intro_gr(struct ast_channel *chan, struct vm_state *vms)
 		if (!res) 
 			res = ast_say_number(chan, vms->newmessages, AST_DIGIT_ANY, ast_channel_language(chan), NULL);
 		if (!res) {
-			if ((vms->newmessages == 1)) {
+			if (vms->newmessages == 1) {
 				res = ast_play_and_wait(chan, "vm-INBOX");
 				if (!res)
 					res = ast_play_and_wait(chan, "vm-message");
@@ -9084,7 +9114,7 @@ static int vm_intro_gr(struct ast_channel *chan, struct vm_state *vms)
 		res = ast_play_and_wait(chan, "vm-youhave");
 		if (!res)
 			res = ast_say_number(chan, vms->oldmessages, AST_DIGIT_ANY, ast_channel_language(chan), NULL);
-		if ((vms->oldmessages == 1)){
+		if (vms->oldmessages == 1){
 			res = ast_play_and_wait(chan, "vm-Old");
 			if (!res)
 				res = ast_play_and_wait(chan, "vm-message");
@@ -9315,7 +9345,7 @@ static int vm_intro_en(struct ast_channel *chan, struct vm_state *vms)
 			if ((vms->oldmessages || vms->newmessages) && !res) {
 				res = ast_play_and_wait(chan, "vm-and");
 			} else if (!res) {
-				if ((vms->urgentmessages == 1))
+				if (vms->urgentmessages == 1)
 					res = ast_play_and_wait(chan, "vm-message");
 				else
 					res = ast_play_and_wait(chan, "vm-messages");
@@ -9328,7 +9358,7 @@ static int vm_intro_en(struct ast_channel *chan, struct vm_state *vms)
 			if (vms->oldmessages && !res)
 				res = ast_play_and_wait(chan, "vm-and");
 			else if (!res) {
-				if ((vms->newmessages == 1))
+				if (vms->newmessages == 1)
 					res = ast_play_and_wait(chan, "vm-message");
 				else
 					res = ast_play_and_wait(chan, "vm-messages");
@@ -9480,7 +9510,7 @@ static int vm_intro_se(struct ast_channel *chan, struct vm_state *vms)
 	}
 
 	if (vms->newmessages) {
-		if ((vms->newmessages == 1)) {
+		if (vms->newmessages == 1) {
 			res = ast_play_and_wait(chan, "digits/ett");
 			res = res ? res : ast_play_and_wait(chan, "vm-nytt");
 			res = res ? res : ast_play_and_wait(chan, "vm-message");
@@ -9524,7 +9554,7 @@ static int vm_intro_no(struct ast_channel *chan, struct vm_state *vms)
 	}
 
 	if (vms->newmessages) {
-		if ((vms->newmessages == 1)) {
+		if (vms->newmessages == 1) {
 			res = ast_play_and_wait(chan, "digits/1");
 			res = res ? res : ast_play_and_wait(chan, "vm-ny");
 			res = res ? res : ast_play_and_wait(chan, "vm-message");
@@ -9559,7 +9589,7 @@ static int vm_intro_de(struct ast_channel *chan, struct vm_state *vms)
 	res = ast_play_and_wait(chan, "vm-youhave");
 	if (!res) {
 		if (vms->newmessages) {
-			if ((vms->newmessages == 1))
+			if (vms->newmessages == 1)
 				res = ast_play_and_wait(chan, "digits/1F");
 			else
 				res = say_and_wait(chan, vms->newmessages, ast_channel_language(chan));
@@ -9568,7 +9598,7 @@ static int vm_intro_de(struct ast_channel *chan, struct vm_state *vms)
 			if (vms->oldmessages && !res)
 				res = ast_play_and_wait(chan, "vm-and");
 			else if (!res) {
-				if ((vms->newmessages == 1))
+				if (vms->newmessages == 1)
 					res = ast_play_and_wait(chan, "vm-message");
 				else
 					res = ast_play_and_wait(chan, "vm-messages");
@@ -9615,7 +9645,7 @@ static int vm_intro_es(struct ast_channel *chan, struct vm_state *vms)
 	if (!res) {
 		if (vms->newmessages) {
 			if (!res) {
-				if ((vms->newmessages == 1)) {
+				if (vms->newmessages == 1) {
 					res = ast_play_and_wait(chan, "digits/1M");
 					if (!res)
 						res = ast_play_and_wait(chan, "vm-message");
@@ -9666,7 +9696,7 @@ static int vm_intro_pt_BR(struct ast_channel *chan, struct vm_state *vms) {
 	if (vms->newmessages) {
 		if (!res)
 			res = ast_say_number(chan, vms->newmessages, AST_DIGIT_ANY, ast_channel_language(chan), "f");
-		if ((vms->newmessages == 1)) {
+		if (vms->newmessages == 1) {
 			if (!res)
 				res = ast_play_and_wait(chan, "vm-message");
 			if (!res)
@@ -9712,7 +9742,7 @@ static int vm_intro_fr(struct ast_channel *chan, struct vm_state *vms)
 			if (vms->oldmessages && !res)
 				res = ast_play_and_wait(chan, "vm-and");
 			else if (!res) {
-				if ((vms->newmessages == 1))
+				if (vms->newmessages == 1)
 					res = ast_play_and_wait(chan, "vm-message");
 				else
 					res = ast_play_and_wait(chan, "vm-messages");
@@ -9759,7 +9789,7 @@ static int vm_intro_nl(struct ast_channel *chan, struct vm_state *vms)
 			if (vms->oldmessages && !res)
 				res = ast_play_and_wait(chan, "vm-and");
 			else if (!res) {
-				if ((vms->newmessages == 1))
+				if (vms->newmessages == 1)
 					res = ast_play_and_wait(chan, "vm-message");
 				else
 					res = ast_play_and_wait(chan, "vm-messages");
@@ -9802,7 +9832,7 @@ static int vm_intro_pt(struct ast_channel *chan, struct vm_state *vms)
 		if (vms->newmessages) {
 			res = ast_say_number(chan, vms->newmessages, AST_DIGIT_ANY, ast_channel_language(chan), "f");
 			if (!res) {
-				if ((vms->newmessages == 1)) {
+				if (vms->newmessages == 1) {
 					res = ast_play_and_wait(chan, "vm-message");
 					if (!res)
 						res = ast_play_and_wait(chan, "vm-INBOXs");
@@ -9868,7 +9898,7 @@ static int vm_intro_cs(struct ast_channel *chan, struct vm_state *vms)
 				res = say_and_wait(chan, vms->newmessages, ast_channel_language(chan));
 			}
 			if (!res) {
-				if ((vms->newmessages == 1))
+				if (vms->newmessages == 1)
 					res = ast_play_and_wait(chan, "vm-novou");
 				if ((vms->newmessages) > 1 && (vms->newmessages < 5))
 					res = ast_play_and_wait(chan, "vm-nove");
@@ -9878,7 +9908,7 @@ static int vm_intro_cs(struct ast_channel *chan, struct vm_state *vms)
 			if (vms->oldmessages && !res)
 				res = ast_play_and_wait(chan, "vm-and");
 			else if (!res) {
-				if ((vms->newmessages == 1))
+				if (vms->newmessages == 1)
 					res = ast_play_and_wait(chan, "vm-zpravu");
 				if ((vms->newmessages) > 1 && (vms->newmessages < 5))
 					res = ast_play_and_wait(chan, "vm-zpravy");
@@ -9889,7 +9919,7 @@ static int vm_intro_cs(struct ast_channel *chan, struct vm_state *vms)
 		if (!res && vms->oldmessages) {
 			res = say_and_wait(chan, vms->oldmessages, ast_channel_language(chan));
 			if (!res) {
-				if ((vms->oldmessages == 1))
+				if (vms->oldmessages == 1)
 					res = ast_play_and_wait(chan, "vm-starou");
 				if ((vms->oldmessages) > 1 && (vms->oldmessages < 5))
 					res = ast_play_and_wait(chan, "vm-stare");
@@ -9897,7 +9927,7 @@ static int vm_intro_cs(struct ast_channel *chan, struct vm_state *vms)
 					res = ast_play_and_wait(chan, "vm-starych");
 			}
 			if (!res) {
-				if ((vms->oldmessages == 1))
+				if (vms->oldmessages == 1)
 					res = ast_play_and_wait(chan, "vm-zpravu");
 				if ((vms->oldmessages) > 1 && (vms->oldmessages < 5))
 					res = ast_play_and_wait(chan, "vm-zpravy");
@@ -13049,10 +13079,13 @@ static int manager_list_voicemail_users(struct mansession *s, const struct messa
 {
 	struct ast_vm_user *vmu = NULL;
 	const char *id = astman_get_header(m, "ActionID");
-	char actionid[128] = "";
+	char actionid[128];
+	int num_users = 0;
 
-	if (!ast_strlen_zero(id))
+	actionid[0] = '\0';
+	if (!ast_strlen_zero(id)) {
 		snprintf(actionid, sizeof(actionid), "ActionID: %s\r\n", id);
+	}
 
 	AST_LIST_LOCK(&users);
 
@@ -13062,20 +13095,20 @@ static int manager_list_voicemail_users(struct mansession *s, const struct messa
 		return RESULT_SUCCESS;
 	}
 	
-	astman_send_ack(s, m, "Voicemail user list will follow");
+	astman_send_listack(s, m, "Voicemail user list will follow", "start");
 	
 	AST_LIST_TRAVERSE(&users, vmu, list) {
 		char dirname[256];
-
 #ifdef IMAP_STORAGE
 		int new, old;
+
 		inboxcount(vmu->mailbox, &new, &old);
 #endif
 		
 		make_dir(dirname, sizeof(dirname), vmu->context, vmu->mailbox, "INBOX");
 		astman_append(s,
-			"%s"
 			"Event: VoicemailUserEntry\r\n"
+			"%s"
 			"VMContext: %s\r\n"
 			"VoiceMailbox: %s\r\n"
 			"Fullname: %s\r\n"
@@ -13144,8 +13177,11 @@ static int manager_list_voicemail_users(struct mansession *s, const struct messa
 			count_messages(vmu, dirname)
 #endif
 			);
+		++num_users;
 	}		
-	astman_append(s, "Event: VoicemailUserEntryComplete\r\n%s\r\n", actionid);
+
+	astman_send_list_complete_start(s, m, "VoicemailUserEntryComplete", num_users);
+	astman_send_list_complete_end(s);
 
 	AST_LIST_UNLOCK(&users);
 
@@ -15176,6 +15212,7 @@ static int play_record_review(struct ast_channel *chan, char *playfile, char *re
 				} else {
 					ast_play_and_wait(chan, "vm-deleted");
 					DELETE(tempfile, -1, tempfile, vmu);
+					DISPOSE(tempfile, -1);
 					cmd = '0';
 				}
 			}

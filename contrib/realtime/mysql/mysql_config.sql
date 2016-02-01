@@ -703,3 +703,85 @@ ALTER TABLE ps_endpoints ADD COLUMN media_encryption_optimistic ENUM('yes','no')
 
 UPDATE alembic_version SET version_num='eb88a14f2a';
 
+-- Running upgrade eb88a14f2a -> 371a3bf4143e
+
+ALTER TABLE ps_endpoints ADD COLUMN user_eq_phone ENUM('yes','no');
+
+UPDATE alembic_version SET version_num='371a3bf4143e';
+
+-- Running upgrade 371a3bf4143e -> 45e3f47c6c44
+
+ALTER TABLE ps_globals ADD COLUMN endpoint_identifier_order VARCHAR(40);
+
+UPDATE alembic_version SET version_num='45e3f47c6c44';
+
+-- Running upgrade 45e3f47c6c44 -> 23530d604b96
+
+ALTER TABLE ps_endpoints ADD COLUMN rpid_immediate ENUM('yes','no');
+
+UPDATE alembic_version SET version_num='23530d604b96';
+
+-- Running upgrade 23530d604b96 -> 31cd4f4891ec
+
+ALTER TABLE ps_endpoints CHANGE dtmf_mode dtmf_mode ENUM('rfc4733','inband','info','auto') NULL;
+
+UPDATE alembic_version SET version_num='31cd4f4891ec';
+
+-- Running upgrade 31cd4f4891ec -> 461d7d691209
+
+ALTER TABLE ps_aors ADD COLUMN qualify_timeout INTEGER;
+
+ALTER TABLE ps_contacts ADD COLUMN qualify_timeout INTEGER;
+
+UPDATE alembic_version SET version_num='461d7d691209';
+
+-- Running upgrade 461d7d691209 -> a541e0b5e89
+
+ALTER TABLE ps_globals ADD COLUMN max_initial_qualify_time INTEGER;
+
+UPDATE alembic_version SET version_num='a541e0b5e89';
+
+-- Running upgrade a541e0b5e89 -> 28b8e71e541f
+
+ALTER TABLE ps_endpoints ADD COLUMN g726_non_standard ENUM('yes','no');
+
+UPDATE alembic_version SET version_num='28b8e71e541f';
+
+-- Running upgrade 28b8e71e541f -> 498357a710ae
+
+ALTER TABLE ps_endpoints ADD COLUMN rtp_keepalive INTEGER;
+
+UPDATE alembic_version SET version_num='498357a710ae';
+
+-- Running upgrade 498357a710ae -> 26f10cadc157
+
+ALTER TABLE ps_endpoints ADD COLUMN rtp_timeout INTEGER;
+
+ALTER TABLE ps_endpoints ADD COLUMN rtp_timeout_hold INTEGER;
+
+UPDATE alembic_version SET version_num='26f10cadc157';
+
+-- Running upgrade 26f10cadc157 -> 154177371065
+
+ALTER TABLE ps_globals ADD COLUMN default_from_user VARCHAR(80);
+
+UPDATE alembic_version SET version_num='154177371065';
+
+-- Running upgrade 154177371065 -> 28ce1e718f05
+
+ALTER TABLE ps_registrations ADD COLUMN fatal_retry_interval INTEGER;
+
+UPDATE alembic_version SET version_num='28ce1e718f05';
+
+-- Running upgrade 28ce1e718f05 -> 189a235b3fd7
+
+ALTER TABLE ps_globals ADD COLUMN keep_alive_interval INTEGER;
+
+UPDATE alembic_version SET version_num='189a235b3fd7';
+
+-- Running upgrade 189a235b3fd7 -> 2d078ec071b7
+
+ALTER TABLE ps_aors CHANGE contact contact VARCHAR(255) NULL;
+
+UPDATE alembic_version SET version_num='2d078ec071b7';
+

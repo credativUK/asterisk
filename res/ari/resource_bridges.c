@@ -24,12 +24,14 @@
  */
 
 /*** MODULEINFO
+	<depend type="module">res_stasis_recording</depend>
+	<depend type="module">res_stasis_playback</depend>
 	<support_level>core</support_level>
  ***/
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 420796 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "resource_bridges.h"
 #include "asterisk/stasis.h"
@@ -693,7 +695,7 @@ void ast_ari_bridges_record(struct ast_variable *headers,
 		return;
 	}
 
-	if (options->if_exists == -1) {
+	if (options->if_exists == AST_RECORD_IF_EXISTS_ERROR) {
 		ast_ari_response_error(
 			response, 400, "Bad Request",
 			"ifExists invalid");
@@ -940,8 +942,8 @@ void ast_ari_bridges_create(struct ast_variable *headers,
 		ast_bridge_snapshot_to_json(snapshot, stasis_app_get_sanitizer()));
 }
 
-void ast_ari_bridges_create_or_update_with_id(struct ast_variable *headers,
-	struct ast_ari_bridges_create_or_update_with_id_args *args,
+void ast_ari_bridges_create_with_id(struct ast_variable *headers,
+	struct ast_ari_bridges_create_with_id_args *args,
 	struct ast_ari_response *response)
 {
 	RAII_VAR(struct ast_bridge *, bridge, find_bridge(response, args->bridge_id), ao2_cleanup);
@@ -949,16 +951,18 @@ void ast_ari_bridges_create_or_update_with_id(struct ast_variable *headers,
 
 	if (bridge) {
 		/* update */
-		if (strcmp(args->name, bridge->name)) {
-			ast_ari_response_error(
-				response, 500, "Internal Error",
-				"Changing bridge name is not implemented");
-			return;
+		if (!ast_strlen_zero(args->name)) {
+			if (!strcmp(args->name, bridge->name)) {
+				ast_ari_response_error(
+					response, 500, "Internal Error",
+					"Changing bridge name is not implemented");
+				return;
+			}
 		}
 		if (!ast_strlen_zero(args->type)) {
 			ast_ari_response_error(
 				response, 500, "Internal Error",
-				"Changing bridge type is not implemented");
+				"Supplying a bridge type when updating a bridge is not allowed.");
 			return;
 		}
 		ast_ari_response_ok(response,

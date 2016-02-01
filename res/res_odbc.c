@@ -47,7 +47,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419592 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/file.h"
 #include "asterisk/channel.h"
@@ -461,7 +461,7 @@ struct odbc_cache_tables *ast_odbc_find_table(const char *database, const char *
 	SQLLEN sqlptr;
 	SQLHSTMT stmt = NULL;
 	int res = 0, error = 0, try = 0;
-	struct odbc_obj *obj = ast_odbc_request_obj(database, 0);
+	struct odbc_obj *obj;
 
 	AST_RWLIST_RDLOCK(&odbc_tables);
 	AST_RWLIST_TRAVERSE(&odbc_tables, tableptr, list) {
@@ -472,13 +472,10 @@ struct odbc_cache_tables *ast_odbc_find_table(const char *database, const char *
 	if (tableptr) {
 		AST_RWLIST_RDLOCK(&tableptr->columns);
 		AST_RWLIST_UNLOCK(&odbc_tables);
-		if (obj) {
-			ast_odbc_release_obj(obj);
-		}
 		return tableptr;
 	}
 
-	if (!obj) {
+	if (!(obj = ast_odbc_request_obj(database, 0))) {
 		ast_log(LOG_WARNING, "Unable to retrieve database handle for table description '%s@%s'\n", tablename, database);
 		AST_RWLIST_UNLOCK(&odbc_tables);
 		return NULL;
@@ -564,9 +561,7 @@ struct odbc_cache_tables *ast_odbc_find_table(const char *database, const char *
 		destroy_table_cache(tableptr);
 		tableptr = NULL;
 	}
-	if (obj) {
-		ast_odbc_release_obj(obj);
-	}
+	ast_odbc_release_obj(obj);
 	return tableptr;
 }
 
@@ -1258,8 +1253,7 @@ struct odbc_obj *_ast_odbc_request_obj2(const char *name, struct ast_flags flags
 		if (obj) {
 			ast_assert(ao2_ref(obj, 0) > 1);
 		}
-		if (!obj && (ast_atomic_fetchadd_int(&class->count, +1) < class->limit) &&
-				(time(NULL) > class->last_negative_connect.tv_sec + class->negative_connection_cache.tv_sec)) {
+		if (!obj && (ast_atomic_fetchadd_int(&class->count, +1) < class->limit)) {
 			obj = ao2_alloc(sizeof(*obj), odbc_obj_destructor);
 			if (!obj) {
 				class->count--;
@@ -1417,10 +1411,7 @@ struct odbc_obj *_ast_odbc_request_obj2(const char *name, struct ast_flags flags
 	}
 
 	if (ast_test_flag(&flags, RES_ODBC_CONNECTED) && !obj->up) {
-		/* Check if this connection qualifies for reconnection, with negative connection cache time */
-		if (time(NULL) > obj->parent->last_negative_connect.tv_sec + obj->parent->negative_connection_cache.tv_sec) {
-			odbc_obj_connect(obj);
-		}
+		odbc_obj_connect(obj);
 	} else if (ast_test_flag(&flags, RES_ODBC_SANITY_CHECK)) {
 		ast_odbc_sanity_check(obj);
 	} else if (obj->parent->idlecheck > 0 && ast_tvdiff_sec(ast_tvnow(), obj->last_used) > obj->parent->idlecheck) {
@@ -1527,6 +1518,7 @@ static odbc_status odbc_obj_connect(struct odbc_obj *obj)
 	char *tracefile = "/tmp/odbc.trace";
 #endif
 	SQLHDBC con;
+	long int negative_cache_expiration;
 
 	if (obj->up) {
 		odbc_obj_disconnect(obj);
@@ -1534,6 +1526,13 @@ static odbc_status odbc_obj_connect(struct odbc_obj *obj)
 	} else {
 		ast_assert(obj->con == NULL);
 		ast_log(LOG_NOTICE, "Connecting %s\n", obj->parent->name);
+	}
+
+	/* Dont connect while server is marked as unreachable via negative_connection_cache */
+	negative_cache_expiration = obj->parent->last_negative_connect.tv_sec + obj->parent->negative_connection_cache.tv_sec;
+	if (time(NULL) < negative_cache_expiration) {
+		ast_log(LOG_WARNING, "Not connecting to %s. Negative connection cache for %ld seconds\n", obj->parent->name, negative_cache_expiration - time(NULL));
+		return ODBC_FAIL;
 	}
 
 	res = SQLAllocHandle(SQL_HANDLE_DBC, obj->parent->env, &con);

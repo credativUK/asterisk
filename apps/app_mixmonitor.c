@@ -39,7 +39,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 424507 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/paths.h"	/* use ast_config_AST_MONITOR_DIR */
 #include "asterisk/stringfields.h"
@@ -727,12 +727,6 @@ static void *mixmonitor_thread(void *obj)
 		ast_audiohook_lock(&mixmonitor->audiohook);
 	}
 
-	/* Test Event */
-	ast_test_suite_event_notify("MIXMONITOR_END", "Channel: %s\r\n"
-									"File: %s\r\n",
-									ast_channel_name(mixmonitor->autochan->chan),
-									mixmonitor->filename);
-
 	ast_audiohook_unlock(&mixmonitor->audiohook);
 
 	ast_channel_lock(mixmonitor->autochan->chan);
@@ -760,6 +754,7 @@ static void *mixmonitor_thread(void *obj)
 	}
 
 	ast_verb(2, "End MixMonitor Recording %s\n", mixmonitor->name);
+	ast_test_suite_event_notify("MIXMONITOR_END", "File: %s\r\n", mixmonitor->filename);
 
 	if (!AST_LIST_EMPTY(&mixmonitor->recipient_list)) {
 		if (ast_strlen_zero(fs_ext)) {

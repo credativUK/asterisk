@@ -840,7 +840,7 @@ static char *cli_notify(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a
 		e->usage =
 			"Usage: pjsip send notify <type> {endpoint|uri} <peer> [<peer>...]\n"
 			"       Send a NOTIFY request to an endpoint\n"
-			"       Message types are defined in sip_notify.conf\n";
+			"       Message types are defined in pjsip_notify.conf\n";
 		return NULL;
 	case CLI_GENERATE:
 		if (a->argc > 4 && (!strcasecmp(a->argv[4], "uri"))) {
@@ -1021,6 +1021,7 @@ static int unload_module(void)
 	ast_manager_unregister("PJSIPNotify");
 	ast_cli_unregister_multiple(cli_options, ARRAY_LEN(cli_options));
 	aco_info_destroy(&notify_cfg);
+	ao2_global_obj_release(globals);
 
 	return 0;
 }

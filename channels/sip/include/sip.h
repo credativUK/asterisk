@@ -291,8 +291,8 @@
 
 /* Sending PROGRESS in-band settings */
 #define SIP_PROG_INBAND        (3 << 25) /*!< DP: three settings, uses two bits */
-#define SIP_PROG_INBAND_NEVER  (0 << 25)
-#define SIP_PROG_INBAND_NO     (1 << 25)
+#define SIP_PROG_INBAND_NO     (0 << 25)
+#define SIP_PROG_INBAND_NEVER  (1 << 25)
 #define SIP_PROG_INBAND_YES    (2 << 25)
 
 #define SIP_USEPATH          (1 << 27) /*!< GDP: Trust and use incoming Path headers? */
@@ -774,6 +774,7 @@ struct sip_settings {
 	int tcp_enabled;
 	int default_max_forwards;    /*!< Default max forwards (SIP Anti-loop) */
 	int websocket_write_timeout; /*!< Socket write timeout for websocket transports, in ms */
+	int websocket_enabled;       /*!< Are websockets enabled? */
 };
 
 struct ast_websocket;
@@ -1869,14 +1870,7 @@ void sip_auth_headers(enum sip_auth_type code, char **header, char **respheader)
 const char *sip_get_header(const struct sip_request *req, const char *name);
 const char *sip_get_transport(enum ast_transport t);
 
-#ifdef REF_DEBUG
-#define sip_ref_peer(arg1,arg2) _ref_peer((arg1),(arg2), __FILE__, __LINE__, __PRETTY_FUNCTION__)
-#define sip_unref_peer(arg1,arg2) _unref_peer((arg1),(arg2), __FILE__, __LINE__, __PRETTY_FUNCTION__)
-struct sip_peer *_ref_peer(struct sip_peer *peer, char *tag, char *file, int line, const char *func);
-void *_unref_peer(struct sip_peer *peer, char *tag, char *file, int line, const char *func);
-#else
-struct sip_peer *sip_ref_peer(struct sip_peer *peer, char *tag);
-void *sip_unref_peer(struct sip_peer *peer, char *tag);
-#endif /* REF_DEBUG */
+#define sip_ref_peer(peer, tag) ao2_t_bump(peer, tag)
+#define sip_unref_peer(peer, tag) ({ ao2_t_cleanup(peer, tag); (NULL); })
 
 #endif

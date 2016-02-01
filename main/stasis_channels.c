@@ -30,7 +30,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 429064 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/astobj2.h"
 #include "asterisk/json.h"
@@ -209,7 +209,8 @@ struct ast_channel_snapshot *ast_channel_snapshot_create(struct ast_channel *cha
 		return NULL;
 	}
 
-	snapshot = ao2_alloc(sizeof(*snapshot), channel_snapshot_dtor);
+	snapshot = ao2_alloc_options(sizeof(*snapshot), channel_snapshot_dtor,
+		AO2_ALLOC_OPT_LOCK_NOLOCK);
 	if (!snapshot || ast_string_field_init(snapshot, 1024)) {
 		ao2_cleanup(snapshot);
 		return NULL;
@@ -363,6 +364,7 @@ static void ast_channel_publish_dial_internal(struct ast_channel *caller,
 }
 
 static void remove_dial_masquerade(struct ast_channel *peer);
+static void remove_dial_masquerade_caller(struct ast_channel *caller);
 static int set_dial_masquerade(struct ast_channel *caller,
 	struct ast_channel *peer, const char *dialstring);
 
@@ -371,6 +373,11 @@ void ast_channel_publish_dial_forward(struct ast_channel *caller, struct ast_cha
 	const char *forward)
 {
 	ast_assert(peer != NULL);
+
+	/* XXX With an early bridge the below dial masquerade datastore code could, theoretically,
+	 * go away as the act of changing the channel during dialing would be done using the bridge
+	 * API itself and not a masquerade.
+	 */
 
 	if (caller) {
 		/*
@@ -406,6 +413,7 @@ void ast_channel_publish_dial_forward(struct ast_channel *caller, struct ast_cha
 			ast_channel_unlock(forwarded);
 		}
 		ast_channel_unlock(peer);
+		remove_dial_masquerade_caller(caller);
 		ast_channel_unlock(caller);
 	}
 }
@@ -617,7 +625,8 @@ void ast_multi_channel_blob_add_channel(struct ast_multi_channel_blob *obj, cons
 		return;
 	}
 
-	role_snapshot = ao2_alloc(sizeof(*role_snapshot) + role_len, channel_role_snapshot_dtor);
+	role_snapshot = ao2_alloc_options(sizeof(*role_snapshot) + role_len, channel_role_snapshot_dtor,
+		AO2_ALLOC_OPT_LOCK_NOLOCK);
 	if (!role_snapshot) {
 		return;
 	}
@@ -784,8 +793,12 @@ static struct ast_manager_event_blob *varset_to_ami(struct stasis_message *msg)
 	struct ast_channel_blob *obj = stasis_message_data(msg);
 	const char *variable =
 		ast_json_string_get(ast_json_object_get(obj->blob, "variable"));
-	const char *value =
-		ast_json_string_get(ast_json_object_get(obj->blob, "value"));
+	RAII_VAR(char *, value, ast_escape_c_alloc(
+			 ast_json_string_get(ast_json_object_get(obj->blob, "value"))), ast_free);
+
+	if (!value) {
+		return NULL;
+	}
 
 	if (obj->snapshot) {
 		channel_event_string =
@@ -888,7 +901,7 @@ struct ast_json *ast_channel_snapshot_to_json(
 		/* Broken up into groups of three for readability */
 		"{ s: s, s: s, s: s,"
 		"  s: o, s: o, s: s,"
-		"  s: o, s: o }",
+		"  s: o, s: o, s: s }",
 		/* First line */
 		"id", snapshot->uniqueid,
 		"name", snapshot->name,
@@ -902,7 +915,8 @@ struct ast_json *ast_channel_snapshot_to_json(
 		/* Third line */
 		"dialplan", ast_json_dialplan_cep(
 			snapshot->context, snapshot->exten, snapshot->priority),
-		"creationtime", ast_json_timeval(snapshot->creationtime, NULL));
+		"creationtime", ast_json_timeval(snapshot->creationtime, NULL),
+		"language", snapshot->language);
 
 	return ast_json_ref(json_chan);
 }
@@ -1002,23 +1016,28 @@ static struct ast_json *dtmf_end_to_json(
 	struct ast_channel_snapshot *snapshot = channel_blob->snapshot;
 	const char *direction =
 		ast_json_string_get(ast_json_object_get(blob, "direction"));
+	const char *digit =
+		ast_json_string_get(ast_json_object_get(blob, "digit"));
+	long duration_ms =
+		ast_json_integer_get(ast_json_object_get(blob, "duration_ms"));
 	const struct timeval *tv = stasis_message_timestamp(message);
-	struct ast_json *json_channel = ast_channel_snapshot_to_json(snapshot, sanitize);
+	struct ast_json *json_channel;
 
 	/* Only present received DTMF end events as JSON */
 	if (strcasecmp("Received", direction) != 0) {
 		return NULL;
 	}
 
+	json_channel = ast_channel_snapshot_to_json(snapshot, sanitize);
 	if (!json_channel) {
 		return NULL;
 	}
 
-	return ast_json_pack("{s: s, s: o, s: O, s: O, s: o}",
+	return ast_json_pack("{s: s, s: o, s: s, s: i, s: o}",
 		"type", "ChannelDtmfReceived",
 		"timestamp", ast_json_timeval(*tv, NULL),
-		"digit", ast_json_object_get(blob, "digit"),
-		"duration_ms", ast_json_object_get(blob, "duration_ms"),
+		"digit", digit,
+		"duration_ms", duration_ms,
 		"channel", json_channel);
 }
 
@@ -1042,6 +1061,12 @@ static struct ast_json *dial_to_json(
 {
 	struct ast_multi_channel_blob *payload = stasis_message_data(message);
 	struct ast_json *blob = ast_multi_channel_blob_get_json(payload);
+	const char *dialstatus =
+		ast_json_string_get(ast_json_object_get(blob, "dialstatus"));
+	const char *forward =
+		ast_json_string_get(ast_json_object_get(blob, "forward"));
+	const char *dialstring =
+		ast_json_string_get(ast_json_object_get(blob, "dialstring"));
 	struct ast_json *caller_json = ast_channel_snapshot_to_json(ast_multi_channel_blob_get_channel(payload, "caller"), sanitize);
 	struct ast_json *peer_json = ast_channel_snapshot_to_json(ast_multi_channel_blob_get_channel(payload, "peer"), sanitize);
 	struct ast_json *forwarded_json = ast_channel_snapshot_to_json(ast_multi_channel_blob_get_channel(payload, "forwarded"), sanitize);
@@ -1049,12 +1074,12 @@ static struct ast_json *dial_to_json(
 	const struct timeval *tv = stasis_message_timestamp(message);
 	int res = 0;
 
-	json = ast_json_pack("{s: s, s: o, s: O, s: O, s: O}",
+	json = ast_json_pack("{s: s, s: o, s: s, s: s, s: s}",
 		"type", "Dial",
 		"timestamp", ast_json_timeval(*tv, NULL),
-		"dialstatus", ast_json_object_get(blob, "dialstatus"),
-		"forward", ast_json_object_get(blob, "forward"),
-		"dialstring", ast_json_object_get(blob, "dialstring"));
+		"dialstatus", dialstatus,
+		"forward", forward,
+		"dialstring", dialstring);
 	if (!json) {
 		ast_json_unref(caller_json);
 		ast_json_unref(peer_json);
@@ -1132,6 +1157,47 @@ static struct ast_json *talking_stop_to_json(struct stasis_message *message,
 	return channel_blob_to_json(message, "ChannelTalkingFinished", sanitize);
 }
 
+static struct ast_json *hold_to_json(struct stasis_message *message,
+	const struct stasis_message_sanitizer *sanitize)
+{
+	struct ast_channel_blob *channel_blob = stasis_message_data(message);
+	struct ast_json *blob = channel_blob->blob;
+	struct ast_channel_snapshot *snapshot = channel_blob->snapshot;
+	const char *musicclass = ast_json_string_get(ast_json_object_get(blob, "musicclass"));
+	const struct timeval *tv = stasis_message_timestamp(message);
+	struct ast_json *json_channel;
+
+	json_channel = ast_channel_snapshot_to_json(snapshot, sanitize);
+	if (!json_channel) {
+		return NULL;
+	}
+
+	return ast_json_pack("{s: s, s: o, s: s, s: o}",
+		"type", "ChannelHold",
+		"timestamp", ast_json_timeval(*tv, NULL),
+		"musicclass", S_OR(musicclass, "N/A"),
+		"channel", json_channel);
+}
+
+static struct ast_json *unhold_to_json(struct stasis_message *message,
+	const struct stasis_message_sanitizer *sanitize)
+{
+	struct ast_channel_blob *channel_blob = stasis_message_data(message);
+	struct ast_channel_snapshot *snapshot = channel_blob->snapshot;
+	const struct timeval *tv = stasis_message_timestamp(message);
+	struct ast_json *json_channel;
+
+	json_channel = ast_channel_snapshot_to_json(snapshot, sanitize);
+	if (!json_channel) {
+		return NULL;
+	}
+
+	return ast_json_pack("{s: s, s: o, s: o}",
+		"type", "ChannelUnhold",
+		"timestamp", ast_json_timeval(*tv, NULL),
+		"channel", json_channel);
+}
+
 /*!
  * @{ \brief Define channel message types.
  */
@@ -1150,8 +1216,12 @@ STASIS_MESSAGE_TYPE_DEFN(ast_channel_dtmf_begin_type);
 STASIS_MESSAGE_TYPE_DEFN(ast_channel_dtmf_end_type,
 	.to_json = dtmf_end_to_json,
 	);
-STASIS_MESSAGE_TYPE_DEFN(ast_channel_hold_type);
-STASIS_MESSAGE_TYPE_DEFN(ast_channel_unhold_type);
+STASIS_MESSAGE_TYPE_DEFN(ast_channel_hold_type,
+	.to_json = hold_to_json,
+	);
+STASIS_MESSAGE_TYPE_DEFN(ast_channel_unhold_type,
+	.to_json = unhold_to_json,
+	);
 STASIS_MESSAGE_TYPE_DEFN(ast_channel_chanspy_start_type);
 STASIS_MESSAGE_TYPE_DEFN(ast_channel_chanspy_stop_type);
 STASIS_MESSAGE_TYPE_DEFN(ast_channel_fax_type);
@@ -1277,6 +1347,7 @@ static void dial_target_free(struct dial_target *doomed)
 		return;
 	}
 	ast_free(doomed->dialstring);
+	ast_channel_cleanup(doomed->peer);
 	ast_free(doomed);
 }
 
@@ -1299,7 +1370,6 @@ static void dial_masquerade_datastore_cleanup(struct dial_masquerade_datastore *
 	while ((cur = AST_LIST_REMOVE_HEAD(&masq_data->dialed_peers, list))) {
 		dial_target_free(cur);
 	}
-	masq_data->caller = NULL;
 }
 
 static void dial_masquerade_datastore_remove_chan(struct dial_masquerade_datastore *masq_data, struct ast_channel *chan)
@@ -1346,6 +1416,16 @@ static struct dial_masquerade_datastore *dial_masquerade_datastore_alloc(void)
  */
 static void dial_masquerade_datastore_destroy(void *data)
 {
+	ao2_ref(data, -1);
+}
+
+/*!
+ * \internal
+ * \brief Datastore destructor for dial_masquerade_datastore
+ */
+static void dial_masquerade_caller_datastore_destroy(void *data)
+{
+	dial_masquerade_datastore_cleanup(data);
 	ao2_ref(data, -1);
 }
 
@@ -1467,6 +1547,13 @@ static const struct ast_datastore_info dial_masquerade_info = {
 	.chan_breakdown = dial_masquerade_breakdown,
 };
 
+static const struct ast_datastore_info dial_masquerade_caller_info = {
+	.type = "stasis-chan-dial-masq",
+	.destroy = dial_masquerade_caller_datastore_destroy,
+	.chan_fixup = dial_masquerade_fixup,
+	.chan_breakdown = dial_masquerade_breakdown,
+};
+
 /*!
  * \internal
  * \brief Find the dial masquerade datastore on the given channel.
@@ -1477,7 +1564,14 @@ static const struct ast_datastore_info dial_masquerade_info = {
  */
 static struct ast_datastore *dial_masquerade_datastore_find(struct ast_channel *chan)
 {
-	return ast_channel_datastore_find(chan, &dial_masquerade_info, NULL);
+	struct ast_datastore *datastore;
+
+	datastore = ast_channel_datastore_find(chan, &dial_masquerade_info, NULL);
+	if (!datastore) {
+		datastore = ast_channel_datastore_find(chan, &dial_masquerade_caller_info, NULL);
+	}
+
+	return datastore;
 }
 
 /*!
@@ -1496,7 +1590,7 @@ static struct dial_masquerade_datastore *dial_masquerade_datastore_add(
 {
 	struct ast_datastore *datastore;
 
-	datastore = ast_datastore_alloc(&dial_masquerade_info, NULL);
+	datastore = ast_datastore_alloc(!masq_data ? &dial_masquerade_caller_info : &dial_masquerade_info, NULL);
 	if (!datastore) {
 		return NULL;
 	}
@@ -1555,7 +1649,7 @@ static int set_dial_masquerade(struct ast_channel *caller, struct ast_channel *p
 			return -1;
 		}
 	}
-	target->peer = peer;
+	target->peer = ast_channel_ref(peer);
 
 	/* Put peer target into datastore */
 	ao2_lock(masq_data);
@@ -1611,5 +1705,26 @@ static void remove_dial_masquerade(struct ast_channel *peer)
 	}
 
 	ast_channel_datastore_remove(peer, datastore);
+	ast_datastore_free(datastore);
+}
+
+static void remove_dial_masquerade_caller(struct ast_channel *caller)
+{
+	struct ast_datastore *datastore;
+	struct dial_masquerade_datastore *masq_data;
+
+	datastore = dial_masquerade_datastore_find(caller);
+	if (!datastore) {
+		return;
+	}
+
+	masq_data = datastore->data;
+	if (!masq_data || !AST_LIST_EMPTY(&masq_data->dialed_peers)) {
+		return;
+	}
+
+	dial_masquerade_datastore_remove_chan(masq_data, caller);
+
+	ast_channel_datastore_remove(caller, datastore);
 	ast_datastore_free(datastore);
 }

@@ -54,15 +54,17 @@ void ast_ari_channels_list(struct ast_variable *headers, struct ast_ari_channels
 struct ast_ari_channels_originate_args {
 	/*! Endpoint to call. */
 	const char *endpoint;
-	/*! The extension to dial after the endpoint answers */
+	/*! The extension to dial after the endpoint answers. Mutually exclusive with 'app'. */
 	const char *extension;
-	/*! The context to dial after the endpoint answers. If omitted, uses 'default' */
+	/*! The context to dial after the endpoint answers. If omitted, uses 'default'. Mutually exclusive with 'app'. */
 	const char *context;
-	/*! The priority to dial after the endpoint answers. If omitted, uses 1 */
+	/*! The priority to dial after the endpoint answers. If omitted, uses 1. Mutually exclusive with 'app'. */
 	long priority;
-	/*! The application that is subscribed to the originated channel, and passed to the Stasis application. */
+	/*! The label to dial after the endpoint answers. Will supersede 'priority' if provided. Mutually exclusive with 'app'. */
+	const char *label;
+	/*! The application that is subscribed to the originated channel. When the channel is answered, it will be passed to this Stasis application. Mutually exclusive with 'context', 'extension', 'priority', and 'label'. */
 	const char *app;
-	/*! The application arguments to pass to the Stasis application. */
+	/*! The application arguments to pass to the Stasis application provided by 'app'. Mutually exclusive with 'context', 'extension', 'priority', and 'label'. */
 	const char *app_args;
 	/*! CallerID to use when dialing the endpoint or extension. */
 	const char *caller_id;
@@ -74,6 +76,8 @@ struct ast_ari_channels_originate_args {
 	const char *channel_id;
 	/*! The unique id to assign the second channel when using local channels. */
 	const char *other_channel_id;
+	/*! The unique id of the channel which is originating this one. */
+	const char *originator;
 };
 /*!
  * \brief Body parsing function for /channels.
@@ -115,15 +119,17 @@ struct ast_ari_channels_originate_with_id_args {
 	const char *channel_id;
 	/*! Endpoint to call. */
 	const char *endpoint;
-	/*! The extension to dial after the endpoint answers */
+	/*! The extension to dial after the endpoint answers. Mutually exclusive with 'app'. */
 	const char *extension;
-	/*! The context to dial after the endpoint answers. If omitted, uses 'default' */
+	/*! The context to dial after the endpoint answers. If omitted, uses 'default'. Mutually exclusive with 'app'. */
 	const char *context;
-	/*! The priority to dial after the endpoint answers. If omitted, uses 1 */
+	/*! The priority to dial after the endpoint answers. If omitted, uses 1. Mutually exclusive with 'app'. */
 	long priority;
-	/*! The application that is subscribed to the originated channel, and passed to the Stasis application. */
+	/*! The label to dial after the endpoint answers. Will supersede 'priority' if provided. Mutually exclusive with 'app'. */
+	const char *label;
+	/*! The application that is subscribed to the originated channel. When the channel is answered, it will be passed to this Stasis application. Mutually exclusive with 'context', 'extension', 'priority', and 'label'. */
 	const char *app;
-	/*! The application arguments to pass to the Stasis application. */
+	/*! The application arguments to pass to the Stasis application provided by 'app'. Mutually exclusive with 'context', 'extension', 'priority', and 'label'. */
 	const char *app_args;
 	/*! CallerID to use when dialing the endpoint or extension. */
 	const char *caller_id;
@@ -133,6 +139,8 @@ struct ast_ari_channels_originate_with_id_args {
 	struct ast_json *variables;
 	/*! The unique id to assign the second channel when using local channels. */
 	const char *other_channel_id;
+	/*! The unique id of the channel which is originating this one. */
+	const char *originator;
 };
 /*!
  * \brief Body parsing function for /channels/{channelId}.
@@ -191,6 +199,8 @@ struct ast_ari_channels_continue_in_dialplan_args {
 	const char *extension;
 	/*! The priority to continue to. */
 	int priority;
+	/*! The label to continue to - will supersede 'priority' if both are provided. */
+	const char *label;
 };
 /*!
  * \brief Body parsing function for /channels/{channelId}/continue.
@@ -211,6 +221,32 @@ int ast_ari_channels_continue_in_dialplan_parse_body(
  * \param[out] response HTTP response
  */
 void ast_ari_channels_continue_in_dialplan(struct ast_variable *headers, struct ast_ari_channels_continue_in_dialplan_args *args, struct ast_ari_response *response);
+/*! Argument struct for ast_ari_channels_redirect() */
+struct ast_ari_channels_redirect_args {
+	/*! Channel's id */
+	const char *channel_id;
+	/*! The endpoint to redirect the channel to */
+	const char *endpoint;
+};
+/*!
+ * \brief Body parsing function for /channels/{channelId}/redirect.
+ * \param body The JSON body from which to parse parameters.
+ * \param[out] args The args structure to parse into.
+ * \retval zero on success
+ * \retval non-zero on failure
+ */
+int ast_ari_channels_redirect_parse_body(
+	struct ast_json *body,
+	struct ast_ari_channels_redirect_args *args);
+
+/*!
+ * \brief Redirect the channel to a different location.
+ *
+ * \param headers HTTP headers
+ * \param args Swagger parameters
+ * \param[out] response HTTP response
+ */
+void ast_ari_channels_redirect(struct ast_variable *headers, struct ast_ari_channels_redirect_args *args, struct ast_ari_response *response);
 /*! Argument struct for ast_ari_channels_answer() */
 struct ast_ari_channels_answer_args {
 	/*! Channel's id */
@@ -496,7 +532,7 @@ int ast_ari_channels_play_with_id_parse_body(
 /*!
  * \brief Start playback of media and specify the playbackId.
  *
- * The media URI may be any of a number of URI's. Currently sound: and recording: URI's are supported. This operation creates a playback resource that can be used to control the playback of media (pause, rewind, fast forward, etc.)
+ * The media URI may be any of a number of URI's. Currently sound:, recording:, number:, digits:, characters:, and tone: URI's are supported. This operation creates a playback resource that can be used to control the playback of media (pause, rewind, fast forward, etc.)
  *
  * \param headers HTTP headers
  * \param args Swagger parameters

@@ -30,12 +30,6 @@
 #include "asterisk/res_pjsip.h"
 #include "asterisk/module.h"
 
-/*! \brief Local host address for IPv4 */
-static char host_ipv4[PJ_INET_ADDRSTRLEN + 2];
-
-/*! \brief Local host address for IPv6 */
-static char host_ipv6[PJ_INET6_ADDRSTRLEN + 2];
-
 /*! \brief Helper function which returns a UDP transport bound to the given address and port */
 static pjsip_transport *multihomed_get_udp_transport(pj_str_t *address, int port)
 {
@@ -75,29 +69,25 @@ static int multihomed_rewrite_sdp(struct pjmedia_sdp_session *sdp)
 	}
 
 	/* If the host address is used in the SDP replace it with the address of what this is going out on */
-	if ((!pj_strcmp2(&sdp->conn->addr_type, "IP4") && !pj_strcmp2(&sdp->conn->addr, host_ipv4)) ||
-		(!pj_strcmp2(&sdp->conn->addr_type, "IP6") && !pj_strcmp2(&sdp->conn->addr, host_ipv6))) {
+	if ((!pj_strcmp2(&sdp->conn->addr_type, "IP4") && !pj_strcmp2(&sdp->conn->addr,
+		ast_sip_get_host_ip_string(pj_AF_INET()))) ||
+		(!pj_strcmp2(&sdp->conn->addr_type, "IP6") && !pj_strcmp2(&sdp->conn->addr,
+		ast_sip_get_host_ip_string(pj_AF_INET6())))) {
 		return 1;
 	}
 
 	return 0;
 }
 
-/*! \brief Helper function which determines if the existing address has priority over new one */
-static int multihomed_rewrite_header(pj_str_t *source, pjsip_transport *transport)
+/*! \brief Helper function which determines if a transport is bound to any */
+static int multihomed_bound_any(pjsip_transport *transport)
 {
 	pj_uint32_t loop6[4] = {0, 0, 0, 0};
 
-	/* If the transport is bound to any it should always rewrite */
 	if ((transport->local_addr.addr.sa_family == pj_AF_INET() &&
 		transport->local_addr.ipv4.sin_addr.s_addr == PJ_INADDR_ANY) ||
 		(transport->local_addr.addr.sa_family == pj_AF_INET6() &&
 		!pj_memcmp(&transport->local_addr.ipv6.sin6_addr, loop6, sizeof(loop6)))) {
-		return 1;
-	}
-
-	/* If the transport is explicitly bound but the determined source differs favor the transport */
-	if (!pj_strcmp(source, &transport->local_name.host)) {
 		return 1;
 	}
 
@@ -107,7 +97,6 @@ static int multihomed_rewrite_header(pj_str_t *source, pjsip_transport *transpor
 static pj_status_t multihomed_on_tx_message(pjsip_tx_data *tdata)
 {
 	pjsip_tpmgr_fla2_param prm;
-	pjsip_transport *transport = NULL;
 	pjsip_cseq_hdr *cseq;
 	pjsip_via_hdr *via;
 
@@ -122,35 +111,46 @@ static pj_status_t multihomed_on_tx_message(pjsip_tx_data *tdata)
 		return PJ_SUCCESS;
 	}
 
-	/* If the transport it is going out on is different reflect it in the message */
-	if (tdata->tp_info.transport->key.type == PJSIP_TRANSPORT_UDP ||
-		tdata->tp_info.transport->key.type == PJSIP_TRANSPORT_UDP6) {
-		transport = multihomed_get_udp_transport(&prm.ret_addr, prm.ret_port);
-	}
+	/* The port in the message should always be that of the original transport */
+	prm.ret_port = tdata->tp_info.transport->local_name.port;
 
-	/* If no new transport use the one provided by the message */
-	if (!transport) {
-		transport = tdata->tp_info.transport;
-	}
+	/* If the IP source differs from the existing transport see if we need to update it */
+	if (pj_strcmp(&prm.ret_addr, &tdata->tp_info.transport->local_name.host)) {
 
-	/* If the message should not be rewritten then abort early */
-	if (!multihomed_rewrite_header(&prm.ret_addr, transport)) {
-		return PJ_SUCCESS;
-	}
+		/* If the transport it is going out on is different reflect it in the message */
+		if (tdata->tp_info.transport->key.type == PJSIP_TRANSPORT_UDP ||
+			tdata->tp_info.transport->key.type == PJSIP_TRANSPORT_UDP6) {
+			pjsip_transport *transport;
 
-	/* Update the transport in case it has changed - we do this now in case we don't want to touch the message above */
-	tdata->tp_info.transport = transport;
+			transport = multihomed_get_udp_transport(&prm.ret_addr, prm.ret_port);
+
+			if (transport) {
+				tdata->tp_info.transport = transport;
+			}
+		}
+
+		/* If the chosen transport is not bound to any we can't use the source address as it won't get back to us */
+		if (!multihomed_bound_any(tdata->tp_info.transport)) {
+			pj_strassign(&prm.ret_addr, &tdata->tp_info.transport->local_name.host);
+		}
+	} else {
+		/* The transport chosen will deliver this but ensure it is updated with the right information */
+		pj_strassign(&prm.ret_addr, &tdata->tp_info.transport->local_name.host);
+	}
 
 	/* If the message needs to be updated with new address do so */
 	if (tdata->msg->type == PJSIP_REQUEST_MSG || !(cseq = pjsip_msg_find_hdr(tdata->msg, PJSIP_H_CSEQ, NULL)) ||
 		pj_strcmp2(&cseq->method.name, "REGISTER")) {
 		pjsip_contact_hdr *contact = pjsip_msg_find_hdr(tdata->msg, PJSIP_H_CONTACT, NULL);
-		if (contact && (PJSIP_URI_SCHEME_IS_SIP(contact->uri) || PJSIP_URI_SCHEME_IS_SIPS(contact->uri))) {
+		if (contact && (PJSIP_URI_SCHEME_IS_SIP(contact->uri) || PJSIP_URI_SCHEME_IS_SIPS(contact->uri))
+			&& !(tdata->msg->type == PJSIP_RESPONSE_MSG && tdata->msg->line.status.code / 100 == 3)) {
 			pjsip_sip_uri *uri = pjsip_uri_get_uri(contact->uri);
 
-			/* prm.ret_addr is allocated from the tdata pool so it is perfectly fine to just do an assignment like this */
+			/* prm.ret_addr is allocated from the tdata pool OR the transport so it is perfectly fine to just do an assignment like this */
 			pj_strassign(&uri->host, &prm.ret_addr);
 			uri->port = prm.ret_port;
+			ast_debug(4, "Re-wrote Contact URI host/port to %.*s:%d\n",
+				(int)pj_strlen(&uri->host), pj_strbuf(&uri->host), uri->port);
 
 			pjsip_tx_data_invalidate_msg(tdata);
 		}
@@ -200,23 +200,12 @@ static int unload_module(void)
 static int load_module(void)
 {
 	char hostname[MAXHOSTNAMELEN] = "";
-	pj_sockaddr addr;
 
 	CHECK_PJSIP_MODULE_LOADED();
 
 	if (!gethostname(hostname, sizeof(hostname) - 1)) {
 		ast_verb(2, "Performing DNS resolution of local hostname '%s' to get local IPv4 and IPv6 address\n",
 			hostname);
-	}
-
-	if (!pj_gethostip(pj_AF_INET(), &addr)) {
-		pj_sockaddr_print(&addr, host_ipv4, sizeof(host_ipv4), 2);
-		ast_verb(3, "Local IPv4 address determined to be: %s\n", host_ipv4);
-	}
-
-	if (!pj_gethostip(pj_AF_INET6(), &addr)) {
-		pj_sockaddr_print(&addr, host_ipv6, sizeof(host_ipv6), 2);
-		ast_verb(3, "Local IPv6 address determined to be: %s\n", host_ipv6);
 	}
 
 	if (ast_sip_register_service(&multihomed_module)) {

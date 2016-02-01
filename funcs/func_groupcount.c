@@ -27,7 +27,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 411328 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/module.h"
 #include "asterisk/channel.h"
@@ -50,7 +50,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 411328 $")
 		</syntax>
 		<description>
 			<para>Calculates the group count for the specified group, or uses the
-			channel's current group if not specifed (and non-empty).</para>
+			channel's current group if not specified (and non-empty).</para>
 		</description>
 	</function>
 	<function name="GROUP_MATCH_COUNT" language="en_US">

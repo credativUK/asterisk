@@ -73,6 +73,20 @@ enum ast_module_load_result {
 	AST_MODULE_LOAD_FAILURE = -1,   /*!< Module could not be loaded properly */
 };
 
+/*!
+ * \since 12
+ * \brief Possible return types for \ref ast_module_reload
+ */
+enum ast_module_reload_result {
+	AST_MODULE_RELOAD_SUCCESS = 0,      /*!< The module was reloaded succesfully */
+	AST_MODULE_RELOAD_QUEUED,           /*!< The module reload request was queued */
+	AST_MODULE_RELOAD_NOT_FOUND,        /*!< The requested module was not found */
+	AST_MODULE_RELOAD_ERROR,            /*!< An error occurred while reloading the module */
+	AST_MODULE_RELOAD_IN_PROGRESS,      /*!< A module reload request is already in progress */
+	AST_MODULE_RELOAD_UNINITIALIZED,    /*!< The module has not been initialized */
+	AST_MODULE_RELOAD_NOT_IMPLEMENTED,  /*!< This module doesn't support reloading */
+};
+
 enum ast_module_support_level {
 	AST_MODULE_SUPPORT_UNKNOWN,
 	AST_MODULE_SUPPORT_CORE,
@@ -107,6 +121,20 @@ enum ast_module_load_result ast_load_resource(const char *resource_name);
  */
 int ast_unload_resource(const char *resource_name, enum ast_module_unload_mode);
 
+/*!
+ * \brief Reload asterisk modules.
+ * \param name the name of the module to reload
+ *
+ * This function reloads the specified module, or if no modules are specified,
+ * it will reload all loaded modules.
+ *
+ * \note Modules are reloaded using their reload() functions, not unloading
+ * them and loading them again.
+ *
+ * \retval The \ref ast_module_reload_result status of the module load request
+ */
+enum ast_module_reload_result ast_module_reload(const char *name);
+
 /*! 
  * \brief Notify when usecount has been changed.
  *
@@ -131,6 +159,43 @@ int ast_update_module_list(int (*modentry)(const char *module, const char *descr
                                            int usecnt, const char *status, const char *like,
                                            enum ast_module_support_level support_level),
                            const char *like);
+
+/*!
+ * \brief Ask for a list of modules, descriptions, use counts and status.
+ * \param modentry A callback to an updater function
+ * \param like
+ * \param data Data passed into the callback for manipulation
+ *
+ * For each of the modules loaded, modentry will be executed with the resource,
+ * description, and usecount values of each particular module.
+ *
+ * \return the number of modules loaded
+ * \since 13.5.0
+ */
+int ast_update_module_list_data(int (*modentry)(const char *module, const char *description,
+                                                int usecnt, const char *status, const char *like,
+                                                enum ast_module_support_level support_level,
+                                                void *data),
+                                const char *like, void *data);
+
+/*!
+ * \brief Ask for a list of modules, descriptions, use counts and status.
+ * \param modentry A callback to an updater function
+ * \param like
+ * \param data Data passed into the callback for manipulation
+ * \param condition The condition to meet
+ *
+ * For each of the modules loaded, modentry will be executed with the resource,
+ * description, and usecount values of each particular module.
+ *
+ * \return the number of conditions met
+ * \since 13.5.0
+ */
+int ast_update_module_list_condition(int (*modentry)(const char *module, const char *description,
+                                                     int usecnt, const char *status, const char *like,
+                                                     enum ast_module_support_level support_level,
+                                                     void *data, const char *condition),
+                                     const char *like, void *data, const char *condition);
 
 /*!
  * \brief Check if module with the name given is loaded
@@ -288,8 +353,31 @@ void __ast_module_user_hangup_all(struct ast_module *);
 #define ast_module_user_remove(user) __ast_module_user_remove(ast_module_info->self, user)
 #define ast_module_user_hangup_all() __ast_module_user_hangup_all(ast_module_info->self)
 
-struct ast_module *ast_module_ref(struct ast_module *);
-void ast_module_unref(struct ast_module *);
+struct ast_module *__ast_module_ref(struct ast_module *mod, const char *file, int line, const char *func);
+void __ast_module_shutdown_ref(struct ast_module *mod, const char *file, int line, const char *func);
+void __ast_module_unref(struct ast_module *mod, const char *file, int line, const char *func);
+
+/*!
+ * \brief Hold a reference to the module
+ * \param mod Module to reference
+ * \return mod
+ *
+ * \note A module reference will prevent the module
+ * from being unloaded.
+ */
+#define ast_module_ref(mod)           __ast_module_ref(mod, __FILE__, __LINE__, __PRETTY_FUNCTION__)
+/*!
+ * \brief Prevent unload of the module before shutdown
+ * \param mod Module to hold
+ *
+ * \note This should not be balanced by a call to ast_module_unref.
+ */
+#define ast_module_shutdown_ref(mod)  __ast_module_shutdown_ref(mod, __FILE__, __LINE__, __PRETTY_FUNCTION__)
+/*!
+ * \brief Release a reference to the module
+ * \param mod Module to release
+ */
+#define ast_module_unref(mod)         __ast_module_unref(mod, __FILE__, __LINE__, __PRETTY_FUNCTION__)
 
 #if defined(__cplusplus) || defined(c_plusplus)
 #define AST_MODULE_INFO(keystr, flags_to_set, desc, load_func, unload_func, reload_func, load_pri, support_level)	\

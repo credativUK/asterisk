@@ -33,7 +33,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 420124 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/_private.h"
 #include "asterisk/paths.h"	/* use ast_config_AST_MODULE_DIR */
@@ -115,14 +115,24 @@ static unsigned int embedding = 1; /* we always start out by registering embedde
 				      since they are here before we dlopen() any
 				   */
 
+/*!
+ * \brief Internal flag to indicate all modules have been initially loaded.
+ */
+static int modules_loaded;
+
 struct ast_module {
 	const struct ast_module_info *info;
+#ifdef REF_DEBUG
+	/* Used to get module references into REF_DEBUG logs */
+	void *ref_debug;
+#endif
 	void *lib;					/* the shared lib, or NULL if embedded */
 	int usecount;					/* the number of 'users' currently in this module */
 	struct module_user_list users;			/* the list of users in the module */
 	struct {
 		unsigned int running:1;
 		unsigned int declined:1;
+		unsigned int keepuntilshutdown:1;
 	} flags;
 	AST_LIST_ENTRY(ast_module) list_entry;
 	AST_DLLIST_ENTRY(ast_module) entry;
@@ -189,6 +199,9 @@ void ast_module_register(const struct ast_module_info *info)
 	ast_debug(5, "Registering module %s\n", info->name);
 
 	mod->info = info;
+#ifdef REF_DEBUG
+	mod->ref_debug = ao2_t_alloc(0, NULL, info->name);
+#endif
 	AST_LIST_HEAD_INIT(&mod->users);
 
 	/* during startup, before the loader has been initialized,
@@ -235,6 +248,9 @@ void ast_module_unregister(const struct ast_module_info *info)
 	if (mod) {
 		ast_debug(5, "Unregistering module %s\n", info->name);
 		AST_LIST_HEAD_DESTROY(&mod->users);
+#ifdef REF_DEBUG
+		ao2_cleanup(mod->ref_debug);
+#endif
 		ast_free(mod);
 	}
 }
@@ -253,6 +269,10 @@ struct ast_module_user *__ast_module_user_add(struct ast_module *mod, struct ast
 	AST_LIST_LOCK(&mod->users);
 	AST_LIST_INSERT_HEAD(&mod->users, u, entry);
 	AST_LIST_UNLOCK(&mod->users);
+
+#ifdef REF_DEBUG
+	ao2_ref(mod->ref_debug, +1);
+#endif
 
 	ast_atomic_fetchadd_int(&mod->usecount, +1);
 
@@ -278,6 +298,10 @@ void __ast_module_user_remove(struct ast_module *mod, struct ast_module_user *u)
 		return;
 	}
 
+#ifdef REF_DEBUG
+	ao2_ref(mod->ref_debug, -1);
+#endif
+
 	ast_atomic_fetchadd_int(&mod->usecount, -1);
 	ast_free(u);
 
@@ -293,6 +317,11 @@ void __ast_module_user_hangup_all(struct ast_module *mod)
 		if (u->chan) {
 			ast_softhangup(u->chan, AST_SOFTHANGUP_APPUNLOAD);
 		}
+
+#ifdef REF_DEBUG
+		ao2_ref(mod->ref_debug, -1);
+#endif
+
 		ast_atomic_fetchadd_int(&mod->usecount, -1);
 		ast_free(u);
 	}
@@ -334,7 +363,7 @@ static int printdigest(const unsigned char *d)
 	char buf[256]; /* large enough so we don't have to worry */
 
 	for (pos = 0, x = 0; x < 16; x++)
-		pos += sprintf(buf + pos, " %02x", (unsigned)*d++);
+		pos += sprintf(buf + pos, " %02hhx", *d++);
 
 	ast_debug(1, "Unexpected signature:%s\n", buf);
 
@@ -459,7 +488,9 @@ static int is_module_loaded(const char *resource_name)
 
 static void unload_dynamic_module(struct ast_module *mod)
 {
+#if defined(HAVE_RTLD_NOLOAD)
 	char *name = ast_strdupa(ast_module_name(mod));
+#endif
 	void *lib = mod->lib;
 
 	/* WARNING: the structure pointed to by mod is going to
@@ -610,10 +641,22 @@ void ast_module_shutdown(void)
 				mod->info->unload();
 			}
 			AST_LIST_HEAD_DESTROY(&mod->users);
+#ifdef REF_DEBUG
+			ao2_cleanup(mod->ref_debug);
+#endif
 			free(mod);
 			somethingchanged = 1;
 		}
 		AST_DLLIST_TRAVERSE_BACKWARDS_SAFE_END;
+		if (!somethingchanged) {
+			AST_DLLIST_TRAVERSE(&module_list, mod, entry) {
+				if (mod->flags.keepuntilshutdown) {
+					ast_module_unref(mod);
+					mod->flags.keepuntilshutdown = 0;
+					somethingchanged = 1;
+				}
+			}
+		}
 	} while (somethingchanged && !final);
 
 	AST_DLLIST_UNLOCK(&module_list);
@@ -729,9 +772,7 @@ void ast_process_pending_reloads(void)
 {
 	struct reload_queue_item *item;
 
-	if (!ast_fully_booted) {
-		return;
-	}
+	modules_loaded = 1;
 
 	AST_LIST_LOCK(&reload_queue);
 
@@ -811,10 +852,10 @@ static void publish_reload_message(const char *name, enum ast_module_reload_resu
 	event_object = ast_json_pack("{s: s, s: s}",
 			"Module", S_OR(name, "All"),
 			"Status", res_buffer);
-	json_object = ast_json_pack("{s: s, s: i, s: O}",
+	json_object = ast_json_pack("{s: s, s: i, s: o}",
 			"type", "Reload",
 			"class_type", EVENT_FLAG_SYSTEM,
-			"event", event_object);
+			"event", ast_json_ref(event_object));
 
 	if (!json_object) {
 		return;
@@ -841,7 +882,7 @@ enum ast_module_reload_result ast_module_reload(const char *name)
 
 	/* If we aren't fully booted, we just pretend we reloaded but we queue this
 	   up to run once we are booted up. */
-	if (!ast_fully_booted) {
+	if (!modules_loaded) {
 		queue_reload_request(name);
 		res = AST_MODULE_RELOAD_QUEUED;
 		goto module_reload_exit;
@@ -1384,6 +1425,60 @@ int ast_update_module_list(int (*modentry)(const char *module, const char *descr
 	return total_mod_loaded;
 }
 
+int ast_update_module_list_data(int (*modentry)(const char *module, const char *description,
+                                                int usecnt, const char *status, const char *like,
+                                                enum ast_module_support_level support_level,
+                                                void *data),
+                                const char *like, void *data)
+{
+	struct ast_module *cur;
+	int total_mod_loaded = 0;
+	AST_LIST_HEAD_NOLOCK(, ast_module) alpha_module_list = AST_LIST_HEAD_NOLOCK_INIT_VALUE;
+
+	AST_DLLIST_LOCK(&module_list);
+
+	AST_DLLIST_TRAVERSE(&module_list, cur, entry) {
+		AST_LIST_INSERT_SORTALPHA(&alpha_module_list, cur, list_entry, resource);
+	}
+
+	while ((cur = AST_LIST_REMOVE_HEAD(&alpha_module_list, list_entry))) {
+		total_mod_loaded += modentry(cur->resource, cur->info->description, cur->usecount,
+		        cur->flags.running? "Running" : "Not Running", like, cur->info->support_level, data);
+	}
+
+	AST_DLLIST_UNLOCK(&module_list);
+
+	return total_mod_loaded;
+}
+
+int ast_update_module_list_condition(int (*modentry)(const char *module, const char *description,
+                                                     int usecnt, const char *status,
+                                                     const char *like,
+                                                     enum ast_module_support_level support_level,
+                                                     void *data, const char *condition),
+                                     const char *like, void *data, const char *condition)
+{
+	struct ast_module *cur;
+	int conditions_met = 0;
+	AST_LIST_HEAD_NOLOCK(, ast_module) alpha_module_list = AST_LIST_HEAD_NOLOCK_INIT_VALUE;
+
+	AST_DLLIST_LOCK(&module_list);
+
+	AST_DLLIST_TRAVERSE(&module_list, cur, entry) {
+		AST_LIST_INSERT_SORTALPHA(&alpha_module_list, cur, list_entry, resource);
+	}
+
+	while ((cur = AST_LIST_REMOVE_HEAD(&alpha_module_list, list_entry))) {
+		conditions_met += modentry(cur->resource, cur->info->description, cur->usecount,
+		        cur->flags.running? "Running" : "Not Running", like, cur->info->support_level, data,
+		        condition);
+	}
+
+	AST_DLLIST_UNLOCK(&module_list);
+
+	return conditions_met;
+}
+
 /*! \brief Check if module exists */
 int ast_module_check(const char *name)
 {
@@ -1430,11 +1525,15 @@ int ast_loader_unregister(int (*v)(void))
 	return cur ? 0 : -1;
 }
 
-struct ast_module *ast_module_ref(struct ast_module *mod)
+struct ast_module *__ast_module_ref(struct ast_module *mod, const char *file, int line, const char *func)
 {
 	if (!mod) {
 		return NULL;
 	}
+
+#ifdef REF_DEBUG
+	__ao2_ref_debug(mod->ref_debug, +1, "", file, line, func);
+#endif
 
 	ast_atomic_fetchadd_int(&mod->usecount, +1);
 	ast_update_use_count();
@@ -1442,11 +1541,25 @@ struct ast_module *ast_module_ref(struct ast_module *mod)
 	return mod;
 }
 
-void ast_module_unref(struct ast_module *mod)
+void __ast_module_shutdown_ref(struct ast_module *mod, const char *file, int line, const char *func)
+{
+	if (!mod || mod->flags.keepuntilshutdown) {
+		return;
+	}
+
+	__ast_module_ref(mod, file, line, func);
+	mod->flags.keepuntilshutdown = 1;
+}
+
+void __ast_module_unref(struct ast_module *mod, const char *file, int line, const char *func)
 {
 	if (!mod) {
 		return;
 	}
+
+#ifdef REF_DEBUG
+	__ao2_ref_debug(mod->ref_debug, -1, "", file, line, func);
+#endif
 
 	ast_atomic_fetchadd_int(&mod->usecount, -1);
 	ast_update_use_count();
@@ -1462,4 +1575,23 @@ const char *support_level_map [] = {
 const char *ast_module_support_level_to_string(enum ast_module_support_level support_level)
 {
 	return support_level_map[support_level];
+}
+
+
+
+/* The following exists for ABI compatibility */
+#undef ast_module_ref
+#undef ast_module_unref
+
+struct ast_module *ast_module_ref(struct ast_module *mod);
+void ast_module_unref(struct ast_module *mod);
+
+struct ast_module *ast_module_ref(struct ast_module *mod)
+{
+	return __ast_module_ref(mod, __FILE__, __LINE__, __PRETTY_FUNCTION__);
+}
+
+void ast_module_unref(struct ast_module *mod)
+{
+	__ast_module_unref(mod, __FILE__, __LINE__, __PRETTY_FUNCTION__);
 }

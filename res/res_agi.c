@@ -31,7 +31,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 426362 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <math.h>
 #include <signal.h>
@@ -2210,8 +2210,9 @@ static int handle_streamfile(struct ast_channel *chan, AGI *agi, int argc, const
 	if ((vfs = ast_openvstream(chan, argv[2], ast_channel_language(chan)))) {
 		ast_debug(1, "Ooh, found a video stream, too\n");
 	}
-
-	ast_verb(3, "Playing '%s' (escape_digits=%s) (sample_offset %ld)\n", argv[2], edigits, sample_offset);
+	ast_verb(3, "<%s> Playing '%s.%s' (escape_digits=%s) (sample_offset %ld) (language '%s')\n",
+		ast_channel_name(chan), argv[2], ast_format_get_name(ast_channel_writeformat(chan)),
+		edigits, sample_offset, S_OR(ast_channel_language(chan), "default"));
 
 	ast_seekstream(fs, 0, SEEK_END);
 	max_length = ast_tellstream(fs);
@@ -2629,8 +2630,8 @@ static int handle_recordfile(struct ast_channel *chan, AGI *agi, int argc, const
 			}
 			f = ast_read(chan);
 			if (!f) {
-				ast_agi_send(agi->fd, chan, "200 result=%d (hangup) endpos=%ld\n", -1, sample_offset);
 				ast_closestream(fs);
+				ast_agi_send(agi->fd, chan, "200 result=%d (hangup) endpos=%ld\n", -1, sample_offset);
 				if (sildet)
 					ast_dsp_free(sildet);
 				return RESULT_FAILURE;
@@ -2644,8 +2645,8 @@ static int handle_recordfile(struct ast_channel *chan, AGI *agi, int argc, const
 					ast_stream_rewind(fs, 200);
 					ast_truncstream(fs);
 					sample_offset = ast_tellstream(fs);
-					ast_agi_send(agi->fd, chan, "200 result=%d (dtmf) endpos=%ld\n", f->subclass.integer, sample_offset);
 					ast_closestream(fs);
+					ast_agi_send(agi->fd, chan, "200 result=%d (dtmf) endpos=%ld\n", f->subclass.integer, sample_offset);
 					ast_frfree(f);
 					if (sildet)
 						ast_dsp_free(sildet);
@@ -2689,8 +2690,8 @@ static int handle_recordfile(struct ast_channel *chan, AGI *agi, int argc, const
 			ast_truncstream(fs);
 			sample_offset = ast_tellstream(fs);
 		}
-		ast_agi_send(agi->fd, chan, "200 result=%d (timeout) endpos=%ld\n", res, sample_offset);
 		ast_closestream(fs);
+		ast_agi_send(agi->fd, chan, "200 result=%d (timeout) endpos=%ld\n", res, sample_offset);
 	}
 
 	if (silence > 0) {

@@ -20,7 +20,7 @@ AC_CONFIG_SRCDIR([main/asterisk.c])
 AC_CONFIG_AUX_DIR(`pwd`)
 
 AC_COPYRIGHT("Asterisk")
-AC_REVISION($Revision: 426234 $)
+AC_REVISION($Revision$)
 
 # preserve any CFLAGS or LDFLAGS that may be set
 # NOTE: This must be done before calling any macros that end up
@@ -386,6 +386,9 @@ AC_ARG_ENABLE([coverage],
 	esac])
 AC_SUBST(AST_CODE_COVERAGE)
 
+AST_CHECK_RAII()
+AST_CHECK_STRSEP_ARRAY_BOUNDS()
+
 # AST_EXT_LIB_SETUP is used to tell configure to handle variables for
 # various packages.
 # $1 is the prefix for the variables in makeopts and autoconfig.h
@@ -411,6 +414,7 @@ AST_EXT_LIB_SETUP([CRYPT], [password and data encryption], [crypt])
 AST_EXT_LIB_SETUP([CRYPTO], [OpenSSL Cryptography], [crypto])
 AST_EXT_LIB_SETUP_OPTIONAL([OPENSSL_SRTP], [OpenSSL SRTP Extension Support], [CRYPTO], [crypto])
 AST_EXT_LIB_SETUP_OPTIONAL([OPENSSL_EC], [OpenSSL Elliptic Curve Support], [CRYPTO], [crypto])
+AST_EXT_LIB_SETUP_OPTIONAL([OPENSSL_ECDH_AUTO], [OpenSSL Auto ECDH Support], [CRYPTO], [crypto])
 AST_EXT_LIB_SETUP([DAHDI], [DAHDI], [dahdi])
 AST_EXT_LIB_SETUP([FFMPEG], [Ffmpeg and avcodec], [avcodec])
 AST_EXT_LIB_SETUP([GSM], [External GSM], [gsm], [, use 'internal' GSM otherwise])
@@ -456,6 +460,8 @@ AST_EXT_LIB_SETUP([PJPROJECT], [PJPROJECT], [pjproject])
 AST_EXT_LIB_SETUP([POPT], [popt], [popt])
 AST_EXT_LIB_SETUP_OPTIONAL([PJ_TRANSACTION_GRP_LOCK], [PJSIP Transaction Group Lock Support], [PJPROJECT], [pjsip])
 AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_REPLACE_MEDIA_STREAM], [PJSIP Media Stream Replacement Support], [PJPROJECT], [pjsip])
+AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_GET_DEST_INFO], [pjsip_get_dest_info support], [PJPROJECT], [pjsip])
+AST_EXT_LIB_SETUP_OPTIONAL([PJ_SSL_CERT_LOAD_FROM_FILES2], [pj_ssl_cert_load_from_files2 support], [PJPROJECT], [pjsip])
 AST_EXT_LIB_SETUP([PORTAUDIO], [PortAudio], [portaudio])
 AST_EXT_LIB_SETUP([PRI], [ISDN PRI], [pri])
 AST_EXT_LIB_SETUP_OPTIONAL([PRI_SETUP_ACK_INBAND], [ISDN PRI progress inband ie in SETUP ACK], [PRI], [pri])
@@ -658,7 +664,25 @@ AC_FUNC_STRNLEN
 AC_FUNC_STRTOD
 AC_FUNC_UTIME_NULL
 AC_FUNC_VPRINTF
-AC_CHECK_FUNCS([asprintf atexit closefrom dup2 eaccess endpwent euidaccess ffsll ftruncate getcwd gethostbyname gethostname getloadavg gettimeofday glob htonll ioperm inet_ntoa isascii memchr memmove memset mkdir mkdtemp munmap ntohll newlocale ppoll putenv re_comp regcomp select setenv socket strcasecmp strcasestr strchr strcspn strdup strerror strlcat strlcpy strncasecmp strndup strnlen strrchr strsep strspn strstr strtod strtol strtold strtoq unsetenv utime vasprintf getpeereid sysctl swapctl])
+AC_CHECK_FUNCS([asprintf atexit closefrom dup2 eaccess endpwent euidaccess ffsll ftruncate getcwd gethostbyname gethostname getloadavg gettimeofday glob ioperm inet_ntoa isascii memchr memmove memset mkdir mkdtemp munmap newlocale ppoll putenv re_comp regcomp select setenv socket strcasecmp strcasestr strchr strcspn strdup strerror strlcat strlcpy strncasecmp strndup strnlen strrchr strsep strspn strstr strtod strtol strtold strtoq unsetenv utime vasprintf getpeereid sysctl swapctl])
+
+AC_MSG_CHECKING(for htonll)
+AC_LINK_IFELSE(
+	[AC_LANG_PROGRAM([#include <arpa/inet.h>],
+		[return htonll(0);])],
+	AC_MSG_RESULT(yes)
+	AC_DEFINE(HAVE_HTONLL, 1, [Define to 1 if arpa/inet.h includes a htonll definition.]),
+	AC_MSG_RESULT(no)
+)
+
+AC_MSG_CHECKING(for ntohll)
+AC_LINK_IFELSE(
+	[AC_LANG_PROGRAM([#include <arpa/inet.h>],
+		[return ntohll(0);])],
+	AC_MSG_RESULT(yes)
+	AC_DEFINE(HAVE_NTOHLL, 1, [Define to 1 if arpa/inet.h includes a ntohll definition.]),
+	AC_MSG_RESULT(no)
+)
 
 # NOTE: we use AC_CHECK_LIB to get -lm into the arguments for later checks,
 # so that AC_CHECK_FUNCS can detect functions in that library.
@@ -883,7 +907,10 @@ AC_RUN_IFELSE(
 		[sem_t sem; return sem_init(&sem, 0, 0);])],
 	AC_MSG_RESULT(yes)
 	AC_DEFINE([HAS_WORKING_SEMAPHORE], 1, [Define to 1 if anonymous semaphores work.]),
-	AC_MSG_RESULT(no)
+	AC_MSG_RESULT(no),
+	AC_MSG_RESULT(cross-compile)
+	AC_MSG_NOTICE([WARNING: result yes guessed because of cross compilation])
+	AC_DEFINE([HAS_WORKING_SEMAPHORE], 1, [Define to 1 if anonymous semaphores work.])
 )
 
 LIBS="$save_LIBS"
@@ -1055,7 +1082,7 @@ fi
 AC_SUBST(AST_DECLARATION_AFTER_STATEMENT)
 
 AC_MSG_CHECKING(for -Wtrampolines support)
-if $(${CC} -Wtrampolines -S -o /dev/null -xc /dev/null > /dev/null 2>&1); then
+if $(${CC} -Wtrampolines -Werror -S -o /dev/null -xc /dev/null > /dev/null 2>&1); then
 	AC_MSG_RESULT(yes)
 	AST_TRAMPOLINES=-Wtrampolines
 else
@@ -1109,17 +1136,6 @@ else
 fi
 AC_SUBST(AST_NATIVE_ARCH)
 
-dnl Nested functions required for RAII implementation
-AC_MSG_CHECKING(for -fnested-functions)
-AC_COMPILE_IFELSE(
-	dnl Prototype needed due to http://gcc.gnu.org/bugzilla/show_bug.cgi?id=36774
-	[AC_LANG_PROGRAM([], [auto void foo(void); void foo(void) {}])],
-	AC_MSG_RESULT(no)
-	[AST_NESTED_FUNCTIONS=],
-	AC_MSG_RESULT(required)
-	[AST_NESTED_FUNCTIONS=-fnested-functions]
-)
-AC_SUBST(AST_NESTED_FUNCTIONS)
 
 dnl Check to see if rpath should be set in LDFLAGS
 AC_ARG_ENABLE(rpath,
@@ -2071,6 +2087,9 @@ AST_C_COMPILE_CHECK([PJSIP_REPLACE_MEDIA_STREAM], [pjmedia_mod_offer_flag flag =
 LIBS="${saved_libs}"
 CPPFLAGS="${saved_cppflags}"
 
+AST_EXT_LIB_CHECK([PJSIP_GET_DEST_INFO], [pjsip], [pjsip_get_dest_info], [pjsip.h], [$PJPROJECT_LIBS], [$PJPROJECT_CFLAGS])
+AST_EXT_LIB_CHECK([PJ_SSL_CERT_LOAD_FROM_FILES2], [pj], [pj_ssl_cert_load_from_files2], [pjlib.h], [$PJPROJECT_LIBS], [$PJPROJECT_CFLAGS])
+
 AST_EXT_LIB_CHECK([POPT], [popt], [poptStrerror], [popt.h])
 
 AST_EXT_LIB_CHECK([PORTAUDIO], [portaudio], [Pa_GetDeviceCount], [portaudio.h])
@@ -2219,8 +2238,8 @@ AST_EXT_LIB_CHECK([SQLITE], [sqlite], [sqlite_exec], [sqlite.h])
 AST_EXT_LIB_CHECK([SQLITE3], [sqlite3], [sqlite3_open], [sqlite3.h], [${PTHREAD_LIBS}], [${PTHREAD_CFLAGS}])
 
 if test "${PBX_SQLITE3}" != 1; then
-	AC_MSG_WARN(*** Asterisk now uses SQLite3 for the internal Asterisk database.)
-	AC_MSG_WARN(*** Please install the SQLite3 development package.)
+	AC_MSG_ERROR(*** Asterisk now uses SQLite3 for the internal Asterisk database.)
+	AC_MSG_ERROR(*** Please install the SQLite3 development package.)
 	exit 1
 fi
 
@@ -2263,6 +2282,11 @@ fi
 if test "$PBX_OPENSSL" = "1";
 then
 	AST_EXT_LIB_CHECK([OPENSSL_EC], [ssl], [EC_KEY_new_by_curve_name], [openssl/ec.h], [-lcrypto])
+fi
+
+if test "$PBX_OPENSSL" = "1";
+then
+        AST_C_DECLARE_CHECK([OPENSSL_ECDH_AUTO], [SSL_CTX_set_ecdh_auto], [openssl/ssl.h])
 fi
 
 AST_EXT_LIB_CHECK([SRTP], [srtp], [srtp_init], [srtp/srtp.h])
@@ -2424,10 +2448,9 @@ AST_EXT_LIB_CHECK([X11], [X11], [XOpenDisplay], [X11/Xlib.h],, [-I/usr/X11R6/inc
 PBX_LAUNCHD=0
 if test "${cross_compiling}" = "no";
 then
-  AC_CHECK_FILE(/sbin/launchd, AC_DEFINE([HAVE_SBIN_LAUNCHD], 1, [Define to 1 if your system has /sbin/launchd.]))
-  if test "${HAVE_SBIN_LAUNCHD}" = 1; then
-    PBX_LAUNCHD=1
-  fi
+  AC_CHECK_FILE(/sbin/launchd,
+    [PBX_LAUNCHD=1]
+    AC_DEFINE([HAVE_SBIN_LAUNCHD], 1, [Define to 1 if your system has /sbin/launchd.]))
 fi
 AC_SUBST(PBX_LAUNCHD)
 

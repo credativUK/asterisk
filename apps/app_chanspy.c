@@ -35,7 +35,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 424507 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <ctype.h>
 #include <errno.h>
@@ -698,6 +698,9 @@ static int channel_spy(struct ast_channel *chan, struct ast_autochan *spyee_auto
 	while (ast_waitfor(chan, -1) > -1 && csth.spy_audiohook.status == AST_AUDIOHOOK_STATUS_RUNNING) {
 		if (!(f = ast_read(chan)) || ast_check_hangup(chan)) {
 			running = -1;
+			if (f) {
+				ast_frfree(f);
+			}
 			break;
 		}
 

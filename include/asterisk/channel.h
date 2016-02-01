@@ -1510,6 +1510,14 @@ const struct ast_channel_tech *ast_get_channel_tech(const char *name);
 void ast_hangup(struct ast_channel *chan);
 
 /*!
+ * \brief Soft hangup all active channels.
+ * \since 13.3.0
+ *
+ * \return Nothing
+ */
+void ast_softhangup_all(void);
+
+/*!
  * \brief Softly hangup up a channel
  *
  * \param chan channel to be soft-hung-up
@@ -1944,6 +1952,21 @@ int ast_write_text(struct ast_channel *chan, struct ast_frame *frame);
 int ast_prod(struct ast_channel *chan);
 
 /*!
+ * \brief Set specific read path on channel.
+ * \since 13.4.0
+ *
+ * \param chan Channel to setup read path.
+ * \param raw_format Format to expect from the channel driver.
+ * \param core_format What the core wants to read.
+ *
+ * \pre chan is locked
+ *
+ * \retval 0 on success.
+ * \retval -1 on error.
+ */
+int ast_set_read_format_path(struct ast_channel *chan, struct ast_format *raw_format, struct ast_format *core_format);
+
+/*!
  * \brief Sets read format on channel chan from capabilities
  * Set read format for channel to whichever component of "format" is best.
  * \param chan channel to change
@@ -2202,22 +2225,11 @@ int ast_channel_defer_dtmf(struct ast_channel *chan);
 /*! Undo defer.  ast_read will return any DTMF characters that were queued */
 void ast_channel_undefer_dtmf(struct ast_channel *chan);
 
-/*! Initiate system shutdown -- prevents new channels from being allocated.
- * \param hangup  If "hangup" is non-zero, all existing channels will receive soft
- *  hangups */
-void ast_begin_shutdown(int hangup);
-
-/*! Cancels an existing shutdown and returns to normal operation */
-void ast_cancel_shutdown(void);
-
 /*! \return number of channels available for lookup */
 int ast_active_channels(void);
 
 /*! \return the number of channels not yet destroyed */
 int ast_undestroyed_channels(void);
-
-/*! \return non-zero if Asterisk is being shut down */
-int ast_shutting_down(void);
 
 /*! Activate a given generator */
 int ast_activate_generator(struct ast_channel *chan, struct ast_generator *gen, void *params);
@@ -3893,6 +3905,26 @@ enum ama_flags ast_channel_string2amaflag(const char *flag);
  */
 const char *ast_channel_amaflags2string(enum ama_flags flags);
 
+enum AST_MONITORING_STATE {
+	AST_MONITOR_RUNNING,
+	AST_MONITOR_PAUSED
+};
+
+/*! Responsible for channel monitoring data */
+struct ast_channel_monitor {
+	struct ast_filestream *read_stream;
+	struct ast_filestream *write_stream;
+	char read_filename[FILENAME_MAX];
+	char write_filename[FILENAME_MAX];
+	char filename_base[FILENAME_MAX];
+	char beep_id[64];
+	int filename_changed;
+	char *format;
+	int joinfiles;
+	enum AST_MONITORING_STATE state;
+	int (*stop)(struct ast_channel *chan, int need_lock);
+};
+
 /* ACCESSOR FUNTIONS */
 /*! \brief Set the channel name */
 void ast_channel_name_set(struct ast_channel *chan, const char *name);
@@ -3908,7 +3940,7 @@ void ast_channel_name_set(struct ast_channel *chan, const char *name);
  *
  * \li language
  * \li accountcode
- * \li peeracccount
+ * \li peeraccount
  * \li linkedid
  */
 DECLARE_STRINGFIELD_SETTERS_FOR(name);
@@ -4186,13 +4218,13 @@ void ast_channel_internal_bridged_channel_set(struct ast_channel *chan, struct a
 
 /*!
  * \since 11
- * \brief Retreive a comma-separated list of channels for which dialed cause information is available
+ * \brief Retrieve a comma-separated list of channels for which dialed cause information is available
  *
  * \details
  * This function makes use of datastore operations on the channel, so
  * it is important to lock the channel before calling this function.
  *
- * \param chan The channel from which to retreive information
+ * \param chan The channel from which to retrieve information
  * \retval NULL on allocation failure
  * \retval Pointer to an ast_str object containing the desired information which must be freed
  */
@@ -4200,7 +4232,7 @@ struct ast_str *ast_channel_dialed_causes_channels(const struct ast_channel *cha
 
 /*!
  * \since 11
- * \brief Retreive a ref-counted cause code information structure
+ * \brief Retrieve a ref-counted cause code information structure
  *
  * \details
  * This function makes use of datastore operations on the channel, so
@@ -4209,8 +4241,8 @@ struct ast_str *ast_channel_dialed_causes_channels(const struct ast_channel *cha
  * calling function must decrease the reference count when it is finished
  * with the object.
  *
- * \param chan The channel from which to retreive information
- * \param chan_name The name of the channel about which to retreive information
+ * \param chan The channel from which to retrieve information
+ * \param chan_name The name of the channel about which to retrieve information
  * \retval NULL on search failure
  * \retval Pointer to a ref-counted ast_control_pvt_cause_code object containing the desired information
  */

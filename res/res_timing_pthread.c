@@ -29,7 +29,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 419592 $");
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$");
 
 #include <stdbool.h>
 #include <math.h>
@@ -143,7 +143,7 @@ static void *pthread_timer_open(void)
 		ast_cond_signal(&timing_thread.cond);
 		ast_mutex_unlock(&timing_thread.lock);
 	}
-	ao2_link(pthread_timers, timer);
+	ao2_link_flags(pthread_timers, timer, OBJ_NOLOCK);
 	ao2_unlock(pthread_timers);
 
 	return timer;
@@ -153,6 +153,7 @@ static void pthread_timer_close(void *data)
 {
 	struct pthread_timer *timer = data;
 
+	ao2_unlink(pthread_timers, timer);
 	ao2_ref(timer, -1);
 }
 

@@ -25,7 +25,6 @@
 
 #include "asterisk/network.h"
 
-#include <execinfo.h>
 #include <time.h>	/* we want to override localtime_r */
 #include <unistd.h>
 #include <string.h>
@@ -485,6 +484,32 @@ long int ast_random(void);
  */
 #define ast_random_double() (((double)ast_random()) / RAND_MAX)
 
+/*!
+ * \brief DEBUG_CHAOS returns failure randomly
+ *
+ * DEBUG_CHAOS_RETURN(failure); can be used to fake
+ * failure of functions such as memory allocation,
+ * for the purposes of testing failure handling.
+ */
+#ifdef DEBUG_CHAOS
+#ifndef DEBUG_CHAOS_ALLOC_CHANCE
+#define DEBUG_CHAOS_ALLOC_CHANCE 100000
+#endif
+/* Could #define DEBUG_CHAOS_ENABLE ast_fully_booted */
+#ifndef DEBUG_CHAOS_ENABLE
+#define DEBUG_CHAOS_ENABLE 1
+#endif
+#define DEBUG_CHAOS_RETURN(CHANCE, FAILURE) \
+	do { \
+		if ((DEBUG_CHAOS_ENABLE) && (ast_random() % CHANCE == 0)) { \
+			return FAILURE; \
+		} \
+	} while (0)
+#else
+#define DEBUG_CHAOS_RETURN(c,f)
+#endif
+
+
 #ifndef __AST_DEBUG_MALLOC
 #define ast_std_malloc malloc
 #define ast_std_calloc calloc
@@ -500,26 +525,13 @@ long int ast_random(void);
 #define ast_free free
 #define ast_free_ptr ast_free
 
-/*
- * This buffer is in static memory. We never intend to read it,
- * nor do we care about multiple threads writing to it at the
- * same time. We only want to know if we're recursing too deep
- * already. 60 entries should be more than enough.  Function
- * call depth rarely exceeds 20 or so.
- */
-#define _AST_MEM_BACKTRACE_BUFLEN 60
-extern void *_ast_mem_backtrace_buffer[_AST_MEM_BACKTRACE_BUFLEN];
-
-/*
- * Ok, this sucks. But if we're already out of mem, we don't
- * want the logger to create infinite recursion (and a crash).
- */
+#if defined(AST_IN_CORE)
 #define MALLOC_FAILURE_MSG \
-	do { \
-		if (backtrace(_ast_mem_backtrace_buffer, _AST_MEM_BACKTRACE_BUFLEN) < _AST_MEM_BACKTRACE_BUFLEN) { \
-			ast_log(LOG_ERROR, "Memory Allocation Failure in function %s at line %d of %s\n", func, lineno, file); \
-		} \
-	} while (0)
+	ast_log_safe(LOG_ERROR, "Memory Allocation Failure in function %s at line %d of %s\n", func, lineno, file)
+#else
+#define MALLOC_FAILURE_MSG \
+	ast_log(LOG_ERROR, "Memory Allocation Failure in function %s at line %d of %s\n", func, lineno, file)
+#endif
 
 /*!
  * \brief A wrapper for malloc()
@@ -536,6 +548,8 @@ AST_INLINE_API(
 void * attribute_malloc _ast_malloc(size_t len, const char *file, int lineno, const char *func),
 {
 	void *p;
+
+	DEBUG_CHAOS_RETURN(DEBUG_CHAOS_ALLOC_CHANCE, NULL);
 
 	if (!(p = malloc(len))) {
 		MALLOC_FAILURE_MSG;
@@ -560,6 +574,8 @@ AST_INLINE_API(
 void * attribute_malloc _ast_calloc(size_t num, size_t len, const char *file, int lineno, const char *func),
 {
 	void *p;
+
+	DEBUG_CHAOS_RETURN(DEBUG_CHAOS_ALLOC_CHANCE, NULL);
 
 	if (!(p = calloc(num, len))) {
 		MALLOC_FAILURE_MSG;
@@ -598,6 +614,8 @@ void * attribute_malloc _ast_realloc(void *p, size_t len, const char *file, int 
 {
 	void *newp;
 
+	DEBUG_CHAOS_RETURN(DEBUG_CHAOS_ALLOC_CHANCE, NULL);
+
 	if (!(newp = realloc(p, len))) {
 		MALLOC_FAILURE_MSG;
 	}
@@ -625,6 +643,8 @@ AST_INLINE_API(
 char * attribute_malloc _ast_strdup(const char *str, const char *file, int lineno, const char *func),
 {
 	char *newstr = NULL;
+
+	DEBUG_CHAOS_RETURN(DEBUG_CHAOS_ALLOC_CHANCE, NULL);
 
 	if (str) {
 		if (!(newstr = strdup(str))) {
@@ -655,6 +675,8 @@ AST_INLINE_API(
 char * attribute_malloc _ast_strndup(const char *str, size_t len, const char *file, int lineno, const char *func),
 {
 	char *newstr = NULL;
+
+	DEBUG_CHAOS_RETURN(DEBUG_CHAOS_ALLOC_CHANCE, NULL);
 
 	if (str) {
 		if (!(newstr = strndup(str, len))) {
@@ -696,6 +718,8 @@ __attribute__((format(printf, 5, 0)))
 int _ast_vasprintf(char **ret, const char *file, int lineno, const char *func, const char *fmt, va_list ap),
 {
 	int res;
+
+	DEBUG_CHAOS_RETURN(DEBUG_CHAOS_ALLOC_CHANCE, -1);
 
 	if ((res = vasprintf(ret, fmt, ap)) == -1) {
 		MALLOC_FAILURE_MSG;
@@ -792,7 +816,7 @@ int ast_safe_mkdir(const char *base_path, const char *path, int mode);
  * \param a the array to bound check
  * \return 0 if value out of bounds, otherwise true (non-zero)
  */
-#define ARRAY_IN_BOUNDS(v, a) IN_BOUNDS(v, 0, ARRAY_LEN(a) - 1)
+#define ARRAY_IN_BOUNDS(v, a) IN_BOUNDS((int) (v), 0, ARRAY_LEN(a) - 1)
 
 /* Definition for Digest authorization */
 struct ast_http_digest {
@@ -1005,11 +1029,26 @@ char *ast_utils_which(const char *binary, char *fullpath, size_t fullpath_size);
  * }
  * \endcode
  */
-#define RAII_VAR(vartype, varname, initval, dtor) \
-    /* Prototype needed due to http://gcc.gnu.org/bugzilla/show_bug.cgi?id=36774 */ \
-    auto void _dtor_ ## varname (vartype * v); \
-    void _dtor_ ## varname (vartype * v) { dtor(*v); } \
+
+#if defined(__clang__)
+typedef void (^_raii_cleanup_block_t)(void);
+static inline void _raii_cleanup_block(_raii_cleanup_block_t *b) { (*b)(); }
+
+#define RAII_VAR(vartype, varname, initval, dtor)                                                                \
+    _raii_cleanup_block_t _raii_cleanup_ ## varname __attribute__((cleanup(_raii_cleanup_block),unused)) = NULL; \
+    __block vartype varname = initval;                                                                           \
+    _raii_cleanup_ ## varname = ^{ {(void)dtor(varname);} }
+
+#elif defined(__GNUC__)
+
+#define RAII_VAR(vartype, varname, initval, dtor)                              \
+    auto void _dtor_ ## varname (vartype * v);                                 \
+    void _dtor_ ## varname (vartype * v) { dtor(*v); }                         \
     vartype varname __attribute__((cleanup(_dtor_ ## varname))) = (initval)
+
+#else
+    #error "Cannot compile Asterisk: unknown and unsupported compiler."
+#endif /* #if __GNUC__ */
 
 /*!
  * \brief Asterisk wrapper around crypt(3).
@@ -1049,5 +1088,28 @@ char *ast_crypt_encrypt(const char *key);
  * \return False (zero) if \a key doesn't match.
  */
 int ast_crypt_validate(const char *key, const char *expected);
+
+/*
+ * \brief Test that a file exists and is readable by the effective user.
+ * \since 13.7.0
+ *
+ * \param filename File to test.
+ * \return True (non-zero) if the file exists and is readable.
+ * \return False (zero) if the file either doesn't exists or is not readable.
+ */
+int ast_file_is_readable(const char *filename);
+
+/*
+ * \brief Compare 2 major.minor.patch.extra version strings.
+ * \since 13.7.0
+ *
+ * \param version1.
+ * \param version2.
+ *
+ * \return <0 if version 1 < version 2.
+ * \return =0 if version 1 = version 2.
+ * \return >0 if version 1 > version 2.
+ */
+int ast_compare_versions(const char *version1, const char *version2);
 
 #endif /* _ASTERISK_UTILS_H */

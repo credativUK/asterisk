@@ -81,7 +81,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 424472 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <pthread.h>
 #include <sys/socket.h>
@@ -7541,7 +7541,7 @@ static int misdn_write(struct ast_channel *ast, struct ast_frame *frame)
 		ast_debug(1, "write2mISDN %p %d bytes: ", p, frame->samples);
 
 		for (i = 0; i < max; i++) {
-			ast_debug(1, "%2.2x ", ((char *) frame->data.ptr)[i]);
+			ast_debug(1, "%02hhx ", ((unsigned char *) frame->data.ptr)[i]);
 		}
 	}
 #endif
@@ -9450,11 +9450,11 @@ static void misdn_facility_ie_handler(enum event_e event, struct misdn_bchannel 
 		break;
 #endif	/* We don't handle this yet */
 	case Fac_SubaddressTransfer:
-		/* We do not have anything to do for this message since we do not handle subaddreses. */
+		/* We do not have anything to do for this message since we do not handle subaddresses. */
 		break;
 	case Fac_RequestSubaddress:
 		/*
-		 * We do not have anything to do for this message since we do not handle subaddreses.
+		 * We do not have anything to do for this message since we do not handle subaddresses.
 		 * However, we do care about some other ie's that should be present.
 		 */
 		if (bc->redirecting.to_changed) {

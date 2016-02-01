@@ -199,6 +199,8 @@ class AsteriskProcessor(SwaggerPostProcessor):
             raise SwaggerError("Summary should end with .", context)
         operation.wiki_summary = wikify(operation.summary or "")
         operation.wiki_notes = wikify(operation.notes or "")
+        for error_response in operation.error_responses:
+            error_response.wiki_reason = wikify(error_response.reason or "")
         operation.parse_body = (operation.body_parameter or operation.has_query_parameters) and True
 
     def process_parameter(self, parameter, context):
@@ -223,6 +225,10 @@ class AsteriskProcessor(SwaggerPostProcessor):
         else:
             parameter.c_space = ' '
         parameter.wiki_description = wikify(parameter.description)
+        if parameter.allowable_values:
+            parameter.wiki_allowable_values = parameter.allowable_values.to_wiki()
+        else:
+            parameter.wiki_allowable_values = None
 
     def process_model(self, model, context):
         model.description_dox = model.description.replace('\n', '\n * ')

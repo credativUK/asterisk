@@ -92,6 +92,21 @@ struct ao2_container *stasis_app_get_all(void);
 int stasis_app_register(const char *app_name, stasis_app_cb handler, void *data);
 
 /*!
+ * \brief Register a new Stasis application that receives all Asterisk events.
+ *
+ * If an application is already registered with the given name, the old
+ * application is sent a 'replaced' message and unregistered.
+ *
+ * \param app_name Name of this application.
+ * \param handler Callback for application messages.
+ * \param data Data blob to pass to the callback. Must be AO2 managed.
+ *
+ * \return 0 for success
+ * \return -1 for error.
+ */
+int stasis_app_register_all(const char *app_name, stasis_app_cb handler, void *data);
+
+/*!
  * \brief Unregister a Stasis application.
  * \param app_name Name of the application to unregister.
  */
@@ -245,8 +260,7 @@ enum stasis_app_user_event_res {
  * \param event_name Name of the Userevent.
  * \param source_uris URIs for the source objects to attach to event.
  * \param sources_count Array size of source_uris.
- * \param userevent_data Custom parameters for the user event
- * \param userevents_count Array size of userevent_data
+ * \param json_variables event blob variables.
  *
  * \return \ref stasis_app_user_event_res return code.
  */
@@ -485,6 +499,17 @@ void stasis_app_control_clear_roles(struct stasis_app_control *control);
  * \return -1 for error.
  */
 int stasis_app_control_continue(struct stasis_app_control *control, const char *context, const char *extension, int priority);
+
+/*!
+ * \brief Redirect a channel in \c res_stasis to a particular endpoint
+ *
+ * \param control Control for \c res_stasis
+ * \param endpoint The endpoint transfer string where the channel should be sent to
+ *
+ * \return 0 for success
+ * \return -1 for error
+ */
+int stasis_app_control_redirect(struct stasis_app_control *control, const char *endpoint);
 
 /*!
  * \brief Indicate ringing to the channel associated with this control.

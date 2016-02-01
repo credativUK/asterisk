@@ -54,9 +54,8 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 428946 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
-#include "asterisk/_private.h"
 #include "asterisk/paths.h"	/* use various ast_config_AST_* */
 #include <ctype.h>
 #include <sys/time.h>
@@ -412,6 +411,9 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 428946 $")
 			</parameter>
 			<parameter name="Reload">
 				<para>Whether or not a reload should take place (or name of specific module).</para>
+			</parameter>
+			<parameter name="PreserveEffectiveContext">
+				<para>Whether the effective category contents should be preserved on template change. Default is true (pre 13.2 behavior).</para>
 			</parameter>
 			<parameter name="Action-000000">
 				<para>Action to take.</para>
@@ -2809,6 +2811,7 @@ AST_THREADSTORAGE(userevent_buf);
  */
 void astman_append(struct mansession *s, const char *fmt, ...)
 {
+	int res;
 	va_list ap;
 	struct ast_str *buf;
 
@@ -2817,8 +2820,11 @@ void astman_append(struct mansession *s, const char *fmt, ...)
 	}
 
 	va_start(ap, fmt);
-	ast_str_set_va(&buf, 0, fmt, ap);
+	res = ast_str_set_va(&buf, 0, fmt, ap);
 	va_end(ap);
+	if (res == AST_DYNSTR_BUILD_FAILED) {
+		return;
+	}
 
 	if (s->f != NULL || s->session->f != NULL) {
 		send_string(s, ast_str_buffer(buf));
@@ -2878,6 +2884,7 @@ void astman_send_error(struct mansession *s, const struct message *m, char *erro
 
 void astman_send_error_va(struct mansession *s, const struct message *m, const char *fmt, ...)
 {
+	int res;
 	va_list ap;
 	struct ast_str *buf;
 	char *msg;
@@ -2887,8 +2894,11 @@ void astman_send_error_va(struct mansession *s, const struct message *m, const c
 	}
 
 	va_start(ap, fmt);
-	ast_str_set_va(&buf, 0, fmt, ap);
+	res = ast_str_set_va(&buf, 0, fmt, ap);
 	va_end(ap);
+	if (res == AST_DYNSTR_BUILD_FAILED) {
+		return;
+	}
 
 	/* astman_append will use the same underlying buffer, so copy the message out
 	 * before sending the response */
@@ -2912,6 +2922,25 @@ static void astman_start_ack(struct mansession *s, const struct message *m)
 void astman_send_listack(struct mansession *s, const struct message *m, char *msg, char *listflag)
 {
 	astman_send_response_full(s, m, "Success", msg, listflag);
+}
+
+void astman_send_list_complete_start(struct mansession *s, const struct message *m, const char *event_name, int count)
+{
+	const char *id = astman_get_header(m, "ActionID");
+
+	astman_append(s, "Event: %s\r\n", event_name);
+	if (!ast_strlen_zero(id)) {
+		astman_append(s, "ActionID: %s\r\n", id);
+	}
+	astman_append(s,
+		"EventList: Complete\r\n"
+		"ListItems: %d\r\n",
+		count);
+}
+
+void astman_send_list_complete_end(struct mansession *s)
+{
+	astman_append(s, "\r\n");
 }
 
 /*! \brief Lock the 'mansession' structure. */
@@ -3205,7 +3234,7 @@ static int authenticate(struct mansession *s, const struct message *m)
 			MD5Update(&md5, (unsigned char *) user->secret, strlen(user->secret));
 			MD5Final(digest, &md5);
 			for (x = 0; x < 16; x++)
-				len += sprintf(md5key + len, "%2.2x", (unsigned)digest[x]);
+				len += sprintf(md5key + len, "%02hhx", digest[x]);
 			if (!strcmp(md5key, key)) {
 				error = 0;
 			} else {
@@ -3448,18 +3477,18 @@ static int action_getconfigjson(struct mansession *s, const struct message *m)
 		category_name = ast_category_get_name(cur_category);
 		astman_append(s, "%s\"", comma1 ? "," : "");
 		astman_append_json(s, category_name);
-		astman_append(s, "\":[");
+		astman_append(s, "\":{");
 		comma1 = 1;
 
 		if (ast_category_is_template(cur_category)) {
-			astman_append(s, "istemplate:1");
+			astman_append(s, "\"istemplate\":1");
 			comma2 = 1;
 		}
 
 		if ((templates = ast_category_get_templates(cur_category))
 			&& ast_str_strlen(templates) > 0) {
 			astman_append(s, "%s", comma2 ? "," : "");
-			astman_append(s, "templates:\"%s\"", ast_str_buffer(templates));
+			astman_append(s, "\"templates\":\"%s\"", ast_str_buffer(templates));
 			ast_free(templates);
 			comma2 = 1;
 		}
@@ -3473,7 +3502,7 @@ static int action_getconfigjson(struct mansession *s, const struct message *m)
 			comma2 = 1;
 		}
 
-		astman_append(s, "]");
+		astman_append(s, "}");
 	}
 	astman_append(s, "}\r\n\r\n");
 
@@ -3599,7 +3628,10 @@ static enum error_type handle_updates(struct mansession *s, const struct message
 			if (inherit) {
 				while ((tmpl_name = ast_strsep(&inherit, ',', AST_STRSEP_STRIP))) {
 					if ((template = ast_category_get(cfg, tmpl_name, "TEMPLATES=restrict"))) {
-						ast_category_inherit(category, template);
+						if (ast_category_inherit(category, template)) {
+							result = FAILURE_ALLOCATION;
+							break;
+						}
 					} else {
 						ast_category_destroy(category);
 						category = NULL;
@@ -3768,6 +3800,8 @@ static int action_updateconfig(struct mansession *s, const struct message *m)
 	const char *dfn = astman_get_header(m, "DstFilename");
 	int res;
 	const char *rld = astman_get_header(m, "Reload");
+	int preserve_effective_context = CONFIG_SAVE_FLAG_PRESERVE_EFFECTIVE_CONTEXT;
+	const char *preserve_effective_context_string = astman_get_header(m, "PreserveEffectiveContext");
 	struct ast_flags config_flags = { CONFIG_FLAG_WITHCOMMENTS | CONFIG_FLAG_NOCACHE };
 	enum error_type result;
 
@@ -3785,7 +3819,10 @@ static int action_updateconfig(struct mansession *s, const struct message *m)
 	result = handle_updates(s, m, cfg, dfn);
 	if (!result) {
 		ast_include_rename(cfg, sfn, dfn); /* change the include references from dfn to sfn, so things match up */
-		res = ast_config_text_file_save(dfn, cfg, "Manager");
+		if (!ast_strlen_zero(preserve_effective_context_string) && !ast_true(preserve_effective_context_string)) {
+			preserve_effective_context = CONFIG_SAVE_FLAG_NONE;
+		}
+		res = ast_config_text_file_save2(dfn, cfg, "Manager", preserve_effective_context);
 		ast_config_destroy(cfg);
 		if (res) {
 			astman_send_error(s, m, "Save of config failed");
@@ -4199,12 +4236,8 @@ static int action_hangup(struct mansession *s, const struct message *m)
 	regfree(&regexbuf);
 	ast_free(regex_string);
 
-	astman_append(s,
-		"Event: ChannelsHungupListComplete\r\n"
-		"EventList: Complete\r\n"
-		"ListItems: %d\r\n"
-		"%s"
-		"\r\n", channels_matched, idText);
+	astman_send_list_complete_start(s, m, "ChannelsHungupListComplete", channels_matched);
+	astman_send_list_complete_end(s);
 
 	return 0;
 }
@@ -4306,7 +4339,7 @@ static int action_status(struct mansession *s, const struct message *m)
 	struct ast_str *write_transpath = ast_str_alloca(256);
 	struct ast_str *read_transpath = ast_str_alloca(256);
 	struct ast_channel *chan;
-	struct ast_str *codec_buf = ast_str_alloca(64);
+	struct ast_str *codec_buf = ast_str_alloca(AST_FORMAT_CAP_NAMES_LEN);
 	int channels = 0;
 	int all = ast_strlen_zero(name); /* set if we want all channels */
 	char id_text[256];
@@ -4342,7 +4375,7 @@ static int action_status(struct mansession *s, const struct message *m)
 		}
 	}
 
-	astman_send_ack(s, m, "Channel status will follow");
+	astman_send_listack(s, m, "Channel status will follow", "start");
 
 	if (!ast_strlen_zero(id)) {
 		snprintf(id_text, sizeof(id_text), "ActionID: %s\r\n", id);
@@ -4439,7 +4472,7 @@ static int action_status(struct mansession *s, const struct message *m)
 			S_OR(ast_channel_dialed(chan)->number.str, ""),
 			S_COR(ast_channel_connected_effective_id(chan).number.valid, ast_channel_connected_effective_id(chan).number.str, "<unknown>"),
 			S_COR(ast_channel_connected_effective_id(chan).name.valid, ast_channel_connected_effective_id(chan).name.str, "<unknown>"),
-			ast_channel_whentohangup(chan)->tv_sec,
+			(long)ast_channel_whentohangup(chan)->tv_sec,
 			bridge ? bridge->uniqueid : "",
 			ast_channel_linkedid(chan),
 			ast_channel_appl(chan),
@@ -4465,11 +4498,9 @@ static int action_status(struct mansession *s, const struct message *m)
 		ast_channel_iterator_destroy(it_chans);
 	}
 
-	astman_append(s,
-		"Event: StatusComplete\r\n"
-		"%s"
-		"Items: %d\r\n"
-		"\r\n", id_text, channels);
+	astman_send_list_complete_start(s, m, "StatusComplete", channels);
+	astman_append(s, "Items: %d\r\n", channels);
+	astman_send_list_complete_end(s);
 
 	ast_free(variable_str);
 
@@ -4527,6 +4558,8 @@ static int action_redirect(struct mansession *s, const struct message *m)
 	int pi = 0;
 	int pi2 = 0;
 	int res;
+	int chan1_wait = 0;
+	int chan2_wait = 0;
 
 	if (ast_strlen_zero(name)) {
 		astman_send_error(s, m, "Channel not specified");
@@ -4611,16 +4644,20 @@ static int action_redirect(struct mansession *s, const struct message *m)
 	}
 
 	/* Dual channel redirect in progress. */
-	if (ast_channel_pbx(chan)) {
-		ast_channel_lock(chan);
+	ast_channel_lock(chan);
+	if (ast_channel_is_bridged(chan)) {
 		ast_set_flag(ast_channel_flags(chan), AST_FLAG_BRIDGE_DUAL_REDIRECT_WAIT);
-		ast_channel_unlock(chan);
+		chan1_wait = 1;
 	}
-	if (ast_channel_pbx(chan2)) {
-		ast_channel_lock(chan2);
+	ast_channel_unlock(chan);
+
+	ast_channel_lock(chan2);
+	if (ast_channel_is_bridged(chan2)) {
 		ast_set_flag(ast_channel_flags(chan2), AST_FLAG_BRIDGE_DUAL_REDIRECT_WAIT);
-		ast_channel_unlock(chan2);
+		chan2_wait = 1;
 	}
+	ast_channel_unlock(chan2);
+
 	res = ast_async_goto(chan, context, exten, pi);
 	if (!res) {
 		if (!ast_strlen_zero(context2)) {
@@ -4638,12 +4675,12 @@ static int action_redirect(struct mansession *s, const struct message *m)
 	}
 
 	/* Release the bridge wait. */
-	if (ast_channel_pbx(chan)) {
+	if (chan1_wait) {
 		ast_channel_lock(chan);
 		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BRIDGE_DUAL_REDIRECT_WAIT);
 		ast_channel_unlock(chan);
 	}
-	if (ast_channel_pbx(chan2)) {
+	if (chan2_wait) {
 		ast_channel_lock(chan2);
 		ast_clear_flag(ast_channel_flags(chan2), AST_FLAG_BRIDGE_DUAL_REDIRECT_WAIT);
 		ast_channel_unlock(chan2);
@@ -4756,7 +4793,7 @@ static int action_atxfer(struct mansession *s, const struct message *m)
 static int check_blacklist(const char *cmd)
 {
 	char *cmd_copy, *cur_cmd;
-	char *cmd_words[MAX_BLACKLIST_CMD_LEN] = { NULL, };
+	char *cmd_words[AST_MAX_CMD_LEN] = { NULL, };
 	int i;
 
 	cmd_copy = ast_strdupa(cmd);
@@ -4926,8 +4963,6 @@ static void *fast_originate(void *data)
 			S_OR(in->cid_name, NULL),
 			in->vars, in->account, &chan, in->early_media, &assignedids);
 	}
-	/* Any vars memory was passed to the ast_pbx_outgoing_xxx() calls. */
-	in->vars = NULL;
 
 	if (!chan) {
 		snprintf(requested_channel, AST_CHANNEL_NAME, "%s/%s", in->tech, in->data);
@@ -5374,11 +5409,11 @@ static int action_originate(struct mansession *s, const struct message *m)
 		}
 	} else if (!ast_strlen_zero(app)) {
 		res = ast_pbx_outgoing_app(tech, cap, data, to, app, appdata, &reason, 1, l, n, vars, account, NULL, assignedids.uniqueid ? &assignedids : NULL);
-		/* Any vars memory was passed to ast_pbx_outgoing_app(). */
+		ast_variables_destroy(vars);
 	} else {
 		if (exten && context && pi) {
 			res = ast_pbx_outgoing_exten(tech, cap, data, to, context, exten, pi, &reason, 1, l, n, vars, account, NULL, bridge_early, assignedids.uniqueid ? &assignedids : NULL);
-			/* Any vars memory was passed to ast_pbx_outgoing_exten(). */
+			ast_variables_destroy(vars);
 		} else {
 			astman_send_error(s, m, "Originate with 'Exten' requires 'Context' and 'Priority'");
 			ast_variables_destroy(vars);
@@ -5908,12 +5943,8 @@ static int action_coreshowchannels(struct mansession *s, const struct message *m
 	}
 	ao2_iterator_destroy(&it_chans);
 
-	astman_append(s,
-		"Event: CoreShowChannelsComplete\r\n"
-		"EventList: Complete\r\n"
-		"ListItems: %d\r\n"
-		"%s"
-		"\r\n", numchans, idText);
+	astman_send_list_complete_start(s, m, "CoreShowChannelsComplete", numchans);
+	astman_send_list_complete_end(s);
 
 	return 0;
 }
@@ -5938,9 +5969,6 @@ static int manager_modulecheck(struct mansession *s, const struct message *m)
 	const char *module = astman_get_header(m, "Module");
 	const char *id = astman_get_header(m, "ActionID");
 	char idText[256];
-#if !defined(LOW_MEMORY)
-	const char *version;
-#endif
 	char filename[PATH_MAX];
 	char *cut;
 
@@ -5957,11 +5985,6 @@ static int manager_modulecheck(struct mansession *s, const struct message *m)
 		astman_send_error(s, m, "Module not loaded");
 		return 0;
 	}
-	snprintf(cut, (sizeof(filename) - strlen(filename)) - 1, ".c");
-	ast_debug(1, "**** ModuleCheck .c file %s\n", filename);
-#if !defined(LOW_MEMORY)
-	version = ast_file_version_find(filename);
-#endif
 
 	if (!ast_strlen_zero(id)) {
 		snprintf(idText, sizeof(idText), "ActionID: %s\r\n", id);
@@ -5970,7 +5993,7 @@ static int manager_modulecheck(struct mansession *s, const struct message *m)
 	}
 	astman_append(s, "Response: Success\r\n%s", idText);
 #if !defined(LOW_MEMORY)
-	astman_append(s, "Version: %s\r\n\r\n", version ? version : "");
+	astman_append(s, "Version: %s\r\n\r\n", ast_get_version());
 #endif
 	return 0;
 }
@@ -6003,14 +6026,31 @@ static int manager_moduleload(struct mansession *s, const struct message *m)
 			astman_send_ack(s, m, "Module unloaded.");
 		}
 	} else if (!strcasecmp(loadtype, "reload")) {
+		/* TODO: Unify the ack/error messages here with action_reload */
 		if (!ast_strlen_zero(module)) {
-			res = ast_module_reload(module);
-			if (res == 0) {
+			enum ast_module_reload_result reload_res = ast_module_reload(module);
+
+			switch (reload_res) {
+			case AST_MODULE_RELOAD_NOT_FOUND:
 				astman_send_error(s, m, "No such module.");
-			} else if (res == 1) {
+				break;
+			case AST_MODULE_RELOAD_NOT_IMPLEMENTED:
 				astman_send_error(s, m, "Module does not support reload action.");
-			} else {
+				break;
+			case AST_MODULE_RELOAD_ERROR:
+				astman_send_error(s, m, "An unknown error occurred");
+				break;
+			case AST_MODULE_RELOAD_IN_PROGRESS:
+				astman_send_error(s, m, "A reload is in progress");
+				break;
+			case AST_MODULE_RELOAD_UNINITIALIZED:
+				astman_send_error(s, m, "Module not initialized");
+				break;
+			case AST_MODULE_RELOAD_QUEUED:
+			case AST_MODULE_RELOAD_SUCCESS:
+				/* Treat a queued request as success */
 				astman_send_ack(s, m, "Module reloaded.");
+				break;
 			}
 		} else {
 			ast_module_reload(NULL);	/* Reload all modules */
@@ -6723,9 +6763,9 @@ static int ast_manager_register_struct(struct manager_action *act)
 			return -1;
 		}
 		if (ret > 0) { /* Insert these alphabetically */
-			prev = cur;
 			break;
 		}
+		prev = cur;
 	}
 
 	ao2_t_ref(act, +1, "action object added to list");
@@ -8563,7 +8603,7 @@ static int __init_manager(int reload, int by_external_config)
 #endif
 		int res;
 
-		ast_register_atexit(manager_shutdown);
+		ast_register_cleanup(manager_shutdown);
 
 		res = STASIS_MESSAGE_TYPE_INIT(ast_manager_get_generic_type);
 		if (res != 0) {

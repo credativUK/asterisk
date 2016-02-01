@@ -57,7 +57,7 @@ static int registrar_get_expiration(const struct ast_sip_aor *aor, const pjsip_c
 	pjsip_expires_hdr *expires;
 	int expiration = aor->default_expiration;
 
-	if (contact->expires != -1) {
+	if (contact && contact->expires != -1) {
 		/* Expiration was provided with the contact itself */
 		expiration = contact->expires;
 	} else if ((expires = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_EXPIRES, NULL))) {
@@ -418,12 +418,12 @@ static int rx_task(void *data)
 	pjsip_contact_hdr *contact_hdr = NULL;
 	struct registrar_contact_details details = { 0, };
 	pjsip_tx_data *tdata;
-	pjsip_response_addr addr;
 	const char *aor_name = ast_sorcery_object_get_id(task_data->aor);
 	RAII_VAR(struct ast_str *, path_str, NULL, ast_free);
 	struct ast_sip_contact *response_contact;
 	char *user_agent = NULL;
 	pjsip_user_agent_hdr *user_agent_hdr;
+	pjsip_expires_hdr *expires_hdr;
 
 	/* Retrieve the current contacts, we'll need to know whether to update or not */
 	contacts = ast_sip_location_retrieve_aor_contacts(task_data->aor);
@@ -500,7 +500,7 @@ static int rx_task(void *data)
 
 			if (ast_sip_location_add_contact(task_data->aor, contact_uri, ast_tvadd(ast_tvnow(),
 				ast_samp2tv(expiration, 1)), path_str ? ast_str_buffer(path_str) : NULL,
-					user_agent)) {
+					user_agent, task_data->endpoint)) {
 				ast_log(LOG_ERROR, "Unable to bind contact '%s' to AOR '%s'\n",
 						contact_uri, aor_name);
 				continue;
@@ -597,11 +597,12 @@ static int rx_task(void *data)
 
 	ao2_callback(contacts, 0, registrar_add_contact, tdata);
 
-	if (pjsip_get_response_addr(tdata->pool, task_data->rdata, &addr) == PJ_SUCCESS) {
-		ast_sip_send_response(&addr, tdata, task_data->endpoint);
-	} else {
-		pjsip_tx_data_dec_ref(tdata);
+	if ((expires_hdr = pjsip_msg_find_hdr(task_data->rdata->msg_info.msg, PJSIP_H_EXPIRES, NULL))) {
+		expires_hdr = pjsip_expires_hdr_create(tdata->pool, registrar_get_expiration(task_data->aor, NULL, task_data->rdata));
+		pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr*)expires_hdr);
 	}
+
+	ast_sip_send_stateful_response(task_data->rdata, tdata, task_data->endpoint);
 
 	return PJ_TRUE;
 }
@@ -766,17 +767,14 @@ static int ami_show_registrations(struct mansession *s, const struct message *m)
 {
 	int count = 0;
 	struct ast_sip_ami ami = { .s = s, .m = m, .arg = &count, .action_id = astman_get_header(m, "ActionID"), };
+
 	astman_send_listack(s, m, "Following are Events for each Inbound "
 			    "registration", "start");
 
 	ami_registrations_endpoints(&ami);
 
-	astman_append(s, "Event: InboundRegistrationDetailComplete\r\n");
-	if (!ast_strlen_zero(ami.action_id)) {
-		astman_append(s, "ActionID: %s\r\n", ami.action_id);
-	}
-	astman_append(s, "EventList: Complete\r\n"
-		      "ListItems: %d\r\n\r\n", count);
+	astman_send_list_complete_start(s, m, "InboundRegistrationDetailComplete", count);
+	astman_send_list_complete_end(s);
 	return 0;
 }
 

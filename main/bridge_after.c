@@ -32,7 +32,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 420940 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/logger.h"
 #include "asterisk/channel.h"
@@ -345,6 +345,7 @@ static void after_bridge_goto_destroy(void *data)
 	ast_free((char *) after_bridge->parseable_goto);
 	ast_free((char *) after_bridge->context);
 	ast_free((char *) after_bridge->exten);
+	ast_free((char *) after_bridge);
 }
 
 /*!

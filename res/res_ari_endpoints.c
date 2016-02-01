@@ -33,13 +33,14 @@
 
 /*** MODULEINFO
 	<depend type="module">res_ari</depend>
+	<depend type="module">res_ari_model</depend>
 	<depend type="module">res_stasis</depend>
 	<support_level>core</support_level>
  ***/
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 420098 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/app.h"
 #include "asterisk/module.h"
@@ -170,7 +171,7 @@ static void ast_ari_endpoints_send_message_cb(
 			goto fin;
 		}
 	}
-	args.variables = ast_json_ref(body);
+	args.variables = body;
 	ast_ari_endpoints_send_message(headers, &args, response);
 #if defined(AST_DEVMODE)
 	code = response->response_code;
@@ -181,6 +182,7 @@ static void ast_ari_endpoints_send_message_cb(
 		break;
 	case 500: /* Internal Server Error */
 	case 501: /* Not Implemented */
+	case 400: /* Invalid parameters for sending a message. */
 	case 404: /* Endpoint not found */
 		is_valid = 1;
 		break;
@@ -396,7 +398,7 @@ static void ast_ari_endpoints_send_message_to_endpoint_cb(
 			goto fin;
 		}
 	}
-	args.variables = ast_json_ref(body);
+	args.variables = body;
 	ast_ari_endpoints_send_message_to_endpoint(headers, &args, response);
 #if defined(AST_DEVMODE)
 	code = response->response_code;

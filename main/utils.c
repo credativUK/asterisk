@@ -29,7 +29,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 427384 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -74,6 +74,11 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 427384 $")
 
 static char base64[64];
 static char b2a[256];
+
+/* This is for binary compatibility with modules built before
+ * ast_log_safe existed. */
+#define _AST_MEM_BACKTRACE_BUFLEN 60
+void *_ast_mem_backtrace_buffer[_AST_MEM_BACKTRACE_BUFLEN];
 
 AST_THREADSTORAGE(inet_ntoa_buf);
 
@@ -251,7 +256,7 @@ void ast_md5_hash(char *output, const char *input)
 	MD5Final(digest, &md5);
 	ptr = output;
 	for (x = 0; x < 16; x++)
-		ptr += sprintf(ptr, "%2.2x", (unsigned)digest[x]);
+		ptr += sprintf(ptr, "%02hhx", digest[x]);
 }
 
 /*! \brief Produce 40 char SHA1 hash of value. */
@@ -269,7 +274,7 @@ void ast_sha1_hash(char *output, const char *input)
 	SHA1Result(&sha, Message_Digest);
 	ptr = output;
 	for (x = 0; x < 20; x++)
-		ptr += sprintf(ptr, "%2.2x", (unsigned)Message_Digest[x]);
+		ptr += sprintf(ptr, "%02hhx", Message_Digest[x]);
 }
 
 /*! \brief Produce a 20 byte SHA1 hash of value. */
@@ -420,7 +425,7 @@ char *ast_uri_encode(const char *string, char *outbuf, int buflen, struct ast_fl
 			if (out - outbuf >= buflen - 3) {
 				break;
 			}
-			out += sprintf(out, "%%%02X", (unsigned) *ptr);
+			out += sprintf(out, "%%%02hhX", (unsigned char) *ptr);
 		} else {
 			*out = *ptr;	/* Continue copying the string */
 			out++;
@@ -611,7 +616,7 @@ const char *ast_inet_ntoa(struct in_addr ia)
 	return inet_ntop(AF_INET, &ia, buf, INET_ADDRSTRLEN);
 }
 
-static int dev_urandom_fd;
+static int dev_urandom_fd = -1;
 
 #ifndef __linux__
 #undef pthread_create /* For ast_pthread_create function only */
@@ -1251,8 +1256,8 @@ int ast_pthread_create_stack(pthread_t *thread, pthread_attr_t *attr, void *(*st
 		pthread_attr_init(attr);
 	}
 
-#ifdef __linux__
-	/* On Linux, pthread_attr_init() defaults to PTHREAD_EXPLICIT_SCHED,
+#if defined(__linux__) || defined(__FreeBSD__)
+	/* On Linux and FreeBSD , pthread_attr_init() defaults to PTHREAD_EXPLICIT_SCHED,
 	   which is kind of useless. Change this here to
 	   PTHREAD_INHERIT_SCHED; that way the -p option to set realtime
 	   priority will propagate down to new threads by default.
@@ -1399,7 +1404,13 @@ int ast_carefulwrite(int fd, char *s, int len, int timeoutms)
 
 		if (res < 0 && errno != EAGAIN && errno != EINTR) {
 			/* fatal error from write() */
-			ast_log(LOG_ERROR, "write() returned error: %s\n", strerror(errno));
+			if (errno == EPIPE) {
+#ifndef STANDALONE
+				ast_debug(1, "write() failed due to reading end being closed: %s\n", strerror(errno));
+#endif
+			} else {
+				ast_log(LOG_ERROR, "write() returned error: %s\n", strerror(errno));
+			}
 			return -1;
 		}
 
@@ -1616,6 +1627,136 @@ char *ast_unescape_c(char *src)
 	}
 	*dst = '\0';
 	return ret;
+}
+
+/*
+ * Standard escape sequences - Note, '\0' is not included as a valid character
+ * to escape, but instead is used here as a NULL terminator for the string.
+ */
+char escape_sequences[] = {
+	'\a', '\b', '\f', '\n', '\r', '\t', '\v', '\\', '\'', '\"', '\?', '\0'
+};
+
+/*
+ * Standard escape sequences output map (has to maintain matching order with
+ * escape_sequences). '\0' is included here as a NULL terminator for the string.
+ */
+static char escape_sequences_map[] = {
+	'a', 'b', 'f', 'n', 'r', 't', 'v', '\\', '\'', '"', '?', '\0'
+};
+
+char *ast_escape(char *dest, const char *s, size_t size, const char *to_escape)
+{
+	char *p;
+	char *c;
+
+	if (!dest || !size) {
+		return dest;
+	}
+	if (ast_strlen_zero(s)) {
+		*dest = '\0';
+		return dest;
+	}
+
+	if (ast_strlen_zero(to_escape)) {
+		ast_copy_string(dest, s, size);
+		return dest;
+	}
+
+	for (p = dest; *s && --size; ++s, ++p) {
+		/* If in the list of characters to escape then escape it */
+		if (strchr(to_escape, *s)) {
+			if (!--size) {
+				/* Not enough room left for the escape sequence. */
+				break;
+			}
+
+			/*
+			 * See if the character to escape is part of the standard escape
+			 * sequences. If so we'll have to use its mapped counterpart
+			 * otherwise just use the current character.
+			 */
+			c = strchr(escape_sequences, *s);
+			*p++ = '\\';
+			*p = c ? escape_sequences_map[c - escape_sequences] : *s;
+		} else {
+			*p = *s;
+		}
+	}
+	*p = '\0';
+
+	return dest;
+}
+
+char *ast_escape_c(char *dest, const char *s, size_t size)
+{
+	/*
+	 * Note - This is an optimized version of ast_escape. When looking only
+	 * for escape_sequences a couple of checks used in the generic case can
+	 * be left out thus making it slightly more efficient.
+	 */
+	char *p;
+	char *c;
+
+	if (!dest || !size) {
+		return dest;
+	}
+	if (ast_strlen_zero(s)) {
+		*dest = '\0';
+		return dest;
+	}
+
+	for (p = dest; *s && --size; ++s, ++p) {
+		/*
+		 * See if the character to escape is part of the standard escape
+		 * sequences. If so use its mapped counterpart.
+		 */
+		c = strchr(escape_sequences, *s);
+		if (c) {
+			if (!--size) {
+				/* Not enough room left for the escape sequence. */
+				break;
+			}
+
+			*p++ = '\\';
+			*p = escape_sequences_map[c - escape_sequences];
+		} else {
+			*p = *s;
+		}
+	}
+	*p = '\0';
+
+	return dest;
+}
+
+static char *escape_alloc(const char *s, size_t *size)
+{
+	if (!s) {
+		return NULL;
+	}
+
+	/*
+	 * The result string needs to be twice the size of the given
+	 * string just in case every character in it needs to be escaped.
+	 */
+	*size = strlen(s) * 2 + 1;
+	return ast_malloc(*size);
+}
+
+char *ast_escape_alloc(const char *s, const char *to_escape)
+{
+	size_t size = 0;
+	char *dest = escape_alloc(s, &size);
+
+	return ast_escape(dest, s, size, to_escape);
+}
+
+char *ast_escape_c_alloc(const char *s)
+{
+	size_t size = 0;
+	char *dest = escape_alloc(s, &size);
+
+	return ast_escape_c(dest, s, size);
 }
 
 int ast_build_string_va(char **buffer, size_t *space, const char *fmt, va_list ap)
@@ -1856,7 +1997,7 @@ void ast_join_delim(char *s, size_t len, const char * const w[], unsigned int si
 	/* Join words into a string */
 	if (!s)
 		return;
-	for (x = 0; ofs < len && w[x] && x < size; x++) {
+	for (x = 0; ofs < len && x < size && w[x] ; x++) {
 		if (x > 0)
 			s[ofs++] = delim;
 		for (src = w[x]; *src && ofs < len; src++)
@@ -2476,7 +2617,7 @@ int ast_utils_init(void)
 	ast_cli_register_multiple(utils_cli, ARRAY_LEN(utils_cli));
 #endif
 #endif
-	ast_register_atexit(utils_shutdown);
+	ast_register_cleanup(utils_shutdown);
 	return 0;
 }
 
@@ -2701,10 +2842,10 @@ char *ast_eid_to_str(char *s, int maxlen, struct ast_eid *eid)
 		}
 	} else {
 		for (x = 0; x < 5; x++) {
-			sprintf(s, "%02x:", (unsigned)eid->eid[x]);
+			sprintf(s, "%02hhx:", eid->eid[x]);
 			s += 3;
 		}
-		sprintf(s, "%02x", (unsigned)eid->eid[5]);
+		sprintf(s, "%02hhx", eid->eid[5]);
 	}
 	return os;
 }
@@ -2796,4 +2937,47 @@ int ast_str_to_eid(struct ast_eid *eid, const char *s)
 int ast_eid_cmp(const struct ast_eid *eid1, const struct ast_eid *eid2)
 {
 	return memcmp(eid1, eid2, sizeof(*eid1));
+}
+
+int ast_file_is_readable(const char *filename)
+{
+#if defined(HAVE_EACCESS) || defined(HAVE_EUIDACCESS)
+#if defined(HAVE_EUIDACCESS) && !defined(HAVE_EACCESS)
+#define eaccess euidaccess
+#endif
+	return eaccess(filename, R_OK) == 0;
+#else
+	int fd = open(filename, O_RDONLY |  O_NONBLOCK);
+	if (fd < 0) {
+		return 0;
+	}
+	close(fd);
+	return 1;
+#endif
+}
+
+int ast_compare_versions(const char *version1, const char *version2)
+{
+	unsigned int major[2] = { 0 };
+	unsigned int minor[2] = { 0 };
+	unsigned int patch[2] = { 0 };
+	unsigned int extra[2] = { 0 };
+	int res;
+
+	sscanf(version1, "%u.%u.%u.%u", &major[0], &minor[0], &patch[0], &extra[0]);
+	sscanf(version2, "%u.%u.%u.%u", &major[1], &minor[1], &patch[1], &extra[1]);
+
+	res = major[0] - major[1];
+	if (res) {
+		return res;
+	}
+	res = minor[0] - minor[1];
+	if (res) {
+		return res;
+	}
+	res = patch[0] - patch[1];
+	if (res) {
+		return res;
+	}
+	return extra[0] - extra[1];
 }

@@ -45,7 +45,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 427902 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include <signal.h>
 #include <inttypes.h>
@@ -912,6 +912,16 @@ static struct cdr_object *cdr_object_create_and_append(struct cdr_object *cdr)
 	ast_string_field_set(new_cdr, linkedid, cdr_last->linkedid);
 	ast_string_field_set(new_cdr, appl, cdr_last->appl);
 	ast_string_field_set(new_cdr, data, cdr_last->data);
+	ast_string_field_set(new_cdr, context, cdr_last->context);
+	ast_string_field_set(new_cdr, exten, cdr_last->exten);
+
+	/*
+	 * If the current CDR says to disable all future ones,
+	 * keep the disable chain going
+	 */
+	if (ast_test_flag(&cdr_last->flags, AST_CDR_FLAG_DISABLE_ALL)) {
+		ast_set_flag(&new_cdr->flags, AST_CDR_FLAG_DISABLE_ALL);
+	}
 
 	/* Copy over other Party A information */
 	cdr_object_snapshot_copy(&new_cdr->party_a, &cdr_last->party_a);
@@ -1257,11 +1267,11 @@ static void cdr_object_finalize(struct cdr_object *cdr)
 	/* tv_usec is suseconds_t, which could be int or long */
 	ast_debug(1, "Finalized CDR for %s - start %ld.%06ld answer %ld.%06ld end %ld.%06ld dispo %s\n",
 			cdr->party_a.snapshot->name,
-			cdr->start.tv_sec,
+			(long)cdr->start.tv_sec,
 			(long)cdr->start.tv_usec,
-			cdr->answer.tv_sec,
+			(long)cdr->answer.tv_sec,
 			(long)cdr->answer.tv_usec,
-			cdr->end.tv_sec,
+			(long)cdr->end.tv_sec,
 			(long)cdr->end.tv_usec,
 			ast_cdr_disp2str(cdr->disposition));
 }
@@ -1296,7 +1306,7 @@ static void cdr_object_check_party_a_answer(struct cdr_object *cdr) {
 		cdr->answer = ast_tvnow();
 		/* tv_usec is suseconds_t, which could be int or long */
 		CDR_DEBUG(mod_cfg, "%p - Set answered time to %ld.%06ld\n", cdr,
-			cdr->answer.tv_sec,
+			(long)cdr->answer.tv_sec,
 			(long)cdr->answer.tv_usec);
 	}
 }
@@ -3096,12 +3106,8 @@ int ast_cdr_serialize_variables(const char *channel_name, struct ast_str **buf, 
 	struct cdr_object *it_cdr;
 	struct ast_var_t *variable;
 	const char *var;
-	RAII_VAR(char *, workspace, ast_malloc(256), ast_free);
+	char workspace[256];
 	int total = 0, x = 0, i;
-
-	if (!workspace) {
-		return 0;
-	}
 
 	if (!cdr) {
 		RAII_VAR(struct module_config *, mod_cfg,

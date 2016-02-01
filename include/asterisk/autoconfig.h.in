@@ -324,7 +324,7 @@
 /* Define to 1 if you have the Hoard Memory Allocator library. */
 #undef HAVE_HOARD
 
-/* Define to 1 if you have the `htonll' function. */
+/* Define to 1 if arpa/inet.h includes a htonll definition. */
 #undef HAVE_HTONLL
 
 /* Define to 1 if you have the iCal library. */
@@ -524,7 +524,7 @@
 /* Define to 1 if you have the newt library. */
 #undef HAVE_NEWT
 
-/* Define to 1 if you have the `ntohll' function. */
+/* Define to 1 if arpa/inet.h includes a ntohll definition. */
 #undef HAVE_NTOHLL
 
 /* Define to 1 if your C library can safely print NULL to string formats. */
@@ -547,6 +547,9 @@
 
 /* Define to 1 if CRYPTO has the OpenSSL Elliptic Curve Support feature. */
 #undef HAVE_OPENSSL_EC
+
+/* Define if your system has SSL_CTX_set_ecdh_auto declared. */
+#undef HAVE_OPENSSL_ECDH_AUTO
 
 /* Define to 1 if CRYPTO has the OpenSSL SRTP Extension Support feature. */
 #undef HAVE_OPENSSL_SRTP
@@ -578,8 +581,15 @@
 /* Define if your system has the PJPROJECT libraries. */
 #undef HAVE_PJPROJECT
 
+/* Define to 1 if PJPROJECT has the pjsip_get_dest_info support feature. */
+#undef HAVE_PJSIP_GET_DEST_INFO
+
 /* Define if your system has the PJSIP_REPLACE_MEDIA_STREAM headers. */
 #undef HAVE_PJSIP_REPLACE_MEDIA_STREAM
+
+/* Define to 1 if PJPROJECT has the pj_ssl_cert_load_from_files2 support
+   feature. */
+#undef HAVE_PJ_SSL_CERT_LOAD_FROM_FILES2
 
 /* Define to 1 if PJPROJECT has the PJSIP Transaction Group Lock Support
    feature. */
@@ -1299,6 +1309,14 @@
 
 /* Number of bits in a file offset, on hosts where this is settable. */
 #undef _FILE_OFFSET_BITS
+
+/* Prevent clang array-bounds warning by not using strcmp from bits/string2.h
+   */
+#undef _HAVE_STRING_ARCH_strcmp
+
+/* Prevent clang array-bounds warning by not using strsep from bits/string2.h
+   */
+#undef _HAVE_STRING_ARCH_strsep
 
 /* Define to 1 to make fseeko visible on some hosts (e.g. glibc 2.2). */
 #undef _LARGEFILE_SOURCE

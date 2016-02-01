@@ -18,7 +18,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 417317 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/ari.h"
 #include "asterisk/astobj2.h"
@@ -100,6 +100,10 @@ struct ast_json *ast_ari_websocket_session_read(
 {
 	RAII_VAR(struct ast_json *, message, NULL, ast_json_unref);
 
+	if (ast_websocket_fd(session->ws_session) < 0) {
+		return NULL;
+	}
+
 	while (!message) {
 		int res;
 		char *payload;
@@ -127,7 +131,7 @@ struct ast_json *ast_ari_websocket_session_read(
 
 		switch (opcode) {
 		case AST_WEBSOCKET_OPCODE_CLOSE:
-			ast_debug(1, "WebSocket closed by peer\n");
+			ast_debug(1, "WebSocket closed\n");
 			return NULL;
 		case AST_WEBSOCKET_OPCODE_TEXT:
 			message = ast_json_load_buf(payload, payload_len, NULL);
@@ -159,9 +163,7 @@ int ast_ari_websocket_session_write(struct ast_ari_websocket_session *session,
 #ifdef AST_DEVMODE
 	if (!session->validator(message)) {
 		ast_log(LOG_ERROR, "Outgoing message failed validation\n");
-		return ast_websocket_write(session->ws_session,
-			AST_WEBSOCKET_OPCODE_TEXT, VALIDATION_FAILED,
-			strlen(VALIDATION_FAILED));
+		return ast_websocket_write_string(session->ws_session, VALIDATION_FAILED);
 	}
 #endif
 
@@ -172,9 +174,12 @@ int ast_ari_websocket_session_write(struct ast_ari_websocket_session *session,
 		return -1;
 	}
 
-	ast_debug(3, "Examining ARI event: \n%s\n", str);
-	return ast_websocket_write(session->ws_session,
-		AST_WEBSOCKET_OPCODE_TEXT, str,	strlen(str));
+	ast_debug(3, "Examining ARI event (length %u): \n%s\n", (unsigned int) strlen(str), str);
+	if (ast_websocket_write_string(session->ws_session, str)) {
+		ast_log(LOG_NOTICE, "Problem occurred during websocket write, websocket closed\n");
+		return -1;
+	}
+	return 0;
 }
 
 void ari_handle_websocket(struct ast_websocket_server *ws_server,

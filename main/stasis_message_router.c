@@ -29,7 +29,7 @@
 
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 428687 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/astobj2.h"
 #include "asterisk/stasis_message_router.h"
@@ -255,7 +255,9 @@ void stasis_message_router_unsubscribe(struct stasis_message_router *router)
 		return;
 	}
 
-	stasis_unsubscribe(router->subscription);
+	ao2_lock(router);
+	router->subscription = stasis_unsubscribe(router->subscription);
+	ao2_unlock(router);
 }
 
 void stasis_message_router_unsubscribe_and_join(
