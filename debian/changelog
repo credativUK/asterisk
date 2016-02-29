@@ -1,3 +1,10 @@
+asterisk (1:13.9.1~dfsg-2~bpo8+0.1) jessie; urgency=medium
+
+  * Non-maintainer upload.
+  * Backport for Jessie.
+
+ -- Ondřej Kuzník <ondrej.kuznik@credativ.co.uk>  Mon, 01 Aug 2016 15:29:05 +0100
+
 asterisk (1:13.9.1~dfsg-2) unstable; urgency=medium
 
   [ Tzafrir Cohen ]
