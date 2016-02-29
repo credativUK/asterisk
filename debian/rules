@@ -11,7 +11,7 @@
 #  The "all" option enables "PIE" and "BINDNOW" and future hardening flags
 
 %:
-	dh "$@" --with autotools_dev,autoreconf,systemd
+	dh "$@" --with autotools_dev,autoreconf
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 DPKG_EXPORT_BUILDFLAGS = 1
